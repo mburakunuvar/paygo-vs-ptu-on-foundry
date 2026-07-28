@@ -1,0 +1,35 @@
+{
+  "endpoint": "<https://ptu-benchmarks-resource.openai.azure.com/ - fill from step 7.3>",
+  "api_version": "2026-05-01-preview",
+
+  "deployments": {
+    "global-standard": "<fill after step 7.1>",
+    "provisioned": "<fill after step 7.2>"
+  },
+
+  "seed": 20260727,
+  "trials": 3,
+  "trial_duration_s": 60,
+  "inter_trial_pause_s": 3,
+  "warmup_requests": 5,
+
+  "concurrency_levels": [1, 8, 32],
+  "offered_load_rpm": [9, 18, 27],
+  "streaming_load_rpm": [4, 18],
+
+  "workloads": [
+    { "name": "short-chat", "input_tokens": 200, "max_output_tokens": 100 },
+    { "name": "rag", "input_tokens": 1000, "max_output_tokens": 300 },
+    { "name": "long-gen", "input_tokens": 500, "max_output_tokens": 1000 }
+  ],
+
+  "generation": {
+    "token_param": "max_completion_tokens",
+    "extra_params": {}
+  },
+
+  "timeouts": { "connect_s": 10, "read_s": 180 },
+  "max_in_flight": 512,
+
+  "output_dir": "results"
+}
