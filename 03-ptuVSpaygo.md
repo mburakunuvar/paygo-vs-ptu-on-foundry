@@ -40,7 +40,7 @@ built and debugged before that capacity is created.
 `GlobalStandard` bills per token and costs nothing while idle. Provisioned
 throughput bills for every hour the deployment exists, whether or not a single
 request is sent. Creating both at the same time means every runner defect —
-authentication, token accounting, TTFT event detection, retry bookkeeping, output
+authentication, token accounting, TTFT event detection, failure classification, output
 schema — is discovered while provisioned capacity sits idle and billing.
 
 Building the runner first and validating it against the pay-as-you-go deployment
@@ -105,11 +105,9 @@ Invoke the runner through the environment's own interpreter (`./.venv/bin/python
 rather than activating the shell, so that every command is unambiguous about which
 interpreter ran it.
 
-Record the resolved versions in the manifest before measurement begins:
-
-```bash
-./.venv/bin/python -m pip freeze > results/pip-freeze.txt
-```
+Before creating a client or sending a request, each non-dry runner invocation writes
+the resolved environment to `results/<run-id>/pip-freeze.txt` and records its SHA-256
+digest in the manifest. Failure to capture that snapshot aborts the run.
 
 Exclude `.venv/` from version control.
 
@@ -130,7 +128,7 @@ after live discovery.
 | Foundry resource region | `<region>` |
 | Benchmark client location | `<host and Azure region, if applicable>` |
 | Model and exact version | `<model>` / `<model-version>` |
-| API version | `<api-version>` |
+| Data-plane API surface | Azure OpenAI v1, verified live |
 | Baseline deployment type | `GlobalStandard` |
 | Provisioned deployment type | `<live-discovered provisioned SKU>` |
 | Global Standard capacity | `<live-discovered capacity>` |
@@ -140,6 +138,7 @@ after live discovery.
 | Generation settings | `<temperature, top_p, max output tokens, seed>` |
 | Benchmark runner version | `<commit or release>` |
 | Random seed | `<seed>` |
+| Maximum runner wall time | `<approved measurement window>` |
 
 Hold the following variables constant:
 
@@ -149,7 +148,7 @@ Hold the following variables constant:
 - Generation parameters and maximum output tokens
 - API and SDK versions
 - Client machine, network path, and connection configuration
-- Warm-up policy, request order, trial duration, and retry policy
+- Warm-up policy, request order, trial duration, and one-attempt policy
 
 Do not enable dynamic quota, spillover, or priority processing for only one side
 of the experiment. These features can change request routing or capacity
@@ -332,6 +331,27 @@ az cognitiveservices account deployment create \
   --sku-capacity "$GLOBAL_SKU_CAPACITY"
 ```
 
+**Record deployment outputs** — confirm provisioning state and capture the
+endpoint URL for the runner config:
+
+```bash
+az cognitiveservices account deployment show \
+  --name "$FOUNDRY_NAME" \
+  --resource-group "$RG_NAME" \
+  --deployment-name "$GLOBAL_DEPLOYMENT_NAME" \
+  --query "{State:properties.provisioningState, Model:properties.model.name, Version:properties.model.version, Sku:sku.name, Capacity:sku.capacity}" \
+  -o table
+
+az cognitiveservices account show \
+  --name "$FOUNDRY_NAME" \
+  --resource-group "$RG_NAME" \
+  --query 'properties.endpoints."OpenAI Language Model Instance API"' \
+  -o tsv
+```
+
+Update `bench.config.json` and `03-cli-variables.md` with the deployment name
+and endpoint before proceeding to runner validation.
+
 ### 7.2 Create provisioned throughput
 
 Do not reach this point until the runner has completed a full validation pass
@@ -356,6 +376,21 @@ az cognitiveservices account deployment create \
   --sku-name "$PTU_SKU_NAME" \
   --sku-capacity "$PTU_SKU_CAPACITY"
 ```
+
+**Record deployment outputs** — confirm provisioning succeeded and note the
+timestamp (billing starts now):
+
+```bash
+az cognitiveservices account deployment show \
+  --name "$FOUNDRY_NAME" \
+  --resource-group "$RG_NAME" \
+  --deployment-name "$PTU_DEPLOYMENT_NAME" \
+  --query "{State:properties.provisioningState, Model:properties.model.name, Version:properties.model.version, Sku:sku.name, Capacity:sku.capacity}" \
+  -o table
+```
+
+Update `bench.config.json` and `03-cli-variables.md` with the provisioned
+deployment name. The measurement clock is now running.
 
 ### 7.3 Verify deployment parity
 
@@ -385,7 +420,7 @@ Retrieve the parent Foundry endpoint without exposing credentials:
 az cognitiveservices account show \
   --name "$FOUNDRY_NAME" \
   --resource-group "$RG_NAME" \
-  --query "properties.endpoint" \
+  --query 'properties.endpoints."OpenAI Language Model Instance API"' \
   -o tsv
 ```
 
@@ -399,8 +434,10 @@ benchmark. Exclude smoke requests and warm-up requests from measured results.
 > while nothing is deployed, then validated against the pay-as-you-go deployment
 > from 7.1, and only then pointed at provisioned capacity.
 
-The runner should use an asynchronous client and Entra ID authentication.
-Keep benchmark implementation separate from provisioning.
+The runner uses `AsyncOpenAI` with Entra ID authentication and the Azure OpenAI
+v1 base URL, `<openai-endpoint>/openai/v1/`. The v1 data plane does not take an
+`api-version` query parameter. Keep benchmark implementation separate from
+provisioning.
 
 Install and run it from the project-local virtual environment described in
 [Python environment](#python-environment). Pin dependencies in `requirements.txt`
@@ -411,6 +448,23 @@ Deployment names must be configuration, not code. Moving from the validation
 phase to the measurement phase should require changing a config value only, so
 that no code path is exercised for the first time while provisioned capacity is
 billing.
+
+The configuration must also record the model/version, deployment SKUs and
+capacities, shared content-filter and upgrade policies, benchmark-client location,
+and whether the API surface was verified live. The runner must refuse a live run
+while any required value is missing or a placeholder. It must also refuse when the
+nominal matrix already consumes the configured wall-clock limit, because warm-up
+and request drain still need time inside that limit.
+
+`--dry-run` performs these readiness checks without creating credentials or making
+network calls. It exits nonzero when a selected deployment or required experiment
+value is unresolved.
+
+Readiness validation must reject empty workload or pass lists, duplicate/nonpositive
+load levels, nonpositive token targets or timing values, malformed deployment-SKU
+metadata, and non-boolean API verification. When both sides are selected, deployment
+names and SKU names must be distinct so the benchmark cannot compare a deployment
+or deployment type against itself.
 
 Create at least three stable workload classes:
 
@@ -431,10 +485,20 @@ The runner should implement:
 - Randomized case order using a recorded seed
 - Closed-loop concurrency sweeps, such as 1, 2, 4, 8, 16, and 32 workers
 - Open-loop offered-load sweeps below, near, and above planned capacity
+- A bounded fixed-worker queue for open-loop arrivals; do not create one asyncio
+  task per scheduled request
 - A separate streaming pass for time to first token
 - At least three measured trials per scenario
 - Request-level JSONL or CSV output plus an immutable run manifest
-- Retry accounting that preserves first-attempt and total client latency
+- Exactly one request attempt, with SDK retries disabled so 429 responses remain visible
+- A hard wall-clock deadline that includes warm-up, trials, pauses, and request drain
+- Atomic aggregate checkpoints after every completed trial, plus a partial active
+  trial summary during graceful deadline cancellation
+
+An unsuccessful warm-up is a readiness failure, not a measured sample. Abort before
+the matrix on authentication, API-surface, deployment, or other warm-up errors.
+Every measured trial must record explicit UTC start and end timestamps. Preserve
+completed raw output and aggregates if the hard deadline cancels an in-progress run.
 
 Closed-loop tests answer how the deployment behaves with a fixed number of
 active clients. Open-loop tests answer whether it can sustain a fixed arrival
@@ -453,20 +517,31 @@ Run the same matrix against each deployment:
 | Offered-load sweep | Below/near/above target | Non-streaming | Sustainable throughput |
 | TTFT pass | Low and near target | Streaming | First-token and token cadence |
 
+The checked-in matrix has 24 scenarios: three concurrency levels, three
+offered-load levels, and two streaming levels across three workloads. With two
+deployments and three trials, that is 144 measured trial runs. At 50 seconds plus
+a 3-second pause per run, nominal measurement time is 127.2 minutes, leaving 17.6
+minutes inside the 145-minute limit for warm-up and request drain.
+
 Collect these client-side metrics:
 
 - End-to-end latency p50, p90, p95, and p99
 - Streaming time to first content-bearing token (TTFT)
-- Inter-token latency and stream completion latency
+- Mean output-token interval derived from completion-token usage, and stream completion latency
 - Successful requests per second
 - Input tokens, output tokens, and total tokens per second
 - Output tokens per second for successful completions
-- HTTP 429 rate, other error rate, timeout rate, and retry rate
+- HTTP 429 rate, other error rate, and timeout rate; retries are fixed at zero
 - Offered arrival rate, achieved arrival rate, client queue delay, and backlog
 
 Do not mix streaming and non-streaming latency samples in one distribution.
 Measure TTFT at the first content-bearing stream event, not at response headers
 or an empty role event.
+
+Streaming events are chunks, not guaranteed one-token events. Do not label time
+between chunks as inter-token latency. Derive mean output-token cadence from the
+reported completion-token count and disclose that it is a per-request average,
+not a distribution of individual token arrival intervals.
 
 ## 10. Collect Azure-side metrics
 
@@ -483,7 +558,7 @@ selected model and deployment types, including where available:
 Azure Monitor aggregation can lag behind the client run. Export metrics after
 the aggregation window has completed. Keep service-side metrics separate from
 client-side measurements because client latency includes network time, local
-queuing, SDK retries, and response processing.
+queuing, and response processing.
 
 ## 11. Compare cost and utilization
 
@@ -535,7 +610,7 @@ Before drawing a conclusion, verify:
 
 1. The load generator itself was not CPU, network, socket, or connection-pool limited.
 2. Token distributions were comparable between deployments.
-3. Retries did not hide throttling or inflate only one latency distribution.
+3. The one-attempt policy remained active, so retries did not hide throttling.
 4. Reversing deployment order did not reverse the result.
 5. At least three trials show the same pattern.
 6. Global versus regional routing is disclosed when the deployment types do not have matching routing scope.
@@ -551,14 +626,19 @@ separate experiment.
 | Provisioned SKU is missing | Confirm exact model/version and region support through live catalog discovery |
 | Deployment reports insufficient quota | Check the separate regional quota entry; do not substitute platform capacity for subscription quota |
 | Deployment cannot be reached | Check public network access, private endpoints, DNS, firewall rules, and benchmark-host location |
-| Many 429 responses | Preserve them as benchmark results; verify quota/capacity and retry behavior before changing the test |
+| Many 429 responses | Preserve them as benchmark results; verify quota/capacity and confirm the one-attempt policy before changing the test |
 | Latency rises on both deployments identically | Check the load generator, network, connection pool, and client queue |
 | TTFT is zero or implausibly small | Ensure timing starts before the request and stops at the first content-bearing event |
-| Azure Monitor totals differ | Account for retries, failed calls, UTC boundaries, dimensions, and aggregation delay |
+| Azure Monitor totals differ | Confirm retries remained disabled; account for failed calls, UTC boundaries, dimensions, and aggregation delay |
 
 Stop the benchmark if costs exceed the approved budget, the runner saturates,
 the two deployments are not configuration-equivalent, or monitoring shows an
 unexpected impact on another workload sharing the resource.
+
+The runner's configured wall-clock limit is a mandatory stop, not an estimate. It
+must cancel in-flight work when reached and return a nonzero exit status. This does
+not delete provisioned capacity: immediately follow the cleanup procedure when a
+deadline or warm-up failure stops the run.
 
 ## 14. Cleanup after the benchmark
 

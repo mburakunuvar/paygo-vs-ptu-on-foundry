@@ -1,28 +1,69 @@
 # Benchmark Status Summary — Global Standard vs. Provisioned Throughput
 
+## To-do
+
+- [x] Steps 1-3 — Plan: experiment contract and manifest
+- [x] Steps 4-5 — Discover: model, SKUs, quota, capacity, pricing confirmed
+- [x] Step 8 — Build: benchmark runner written (`app.py`, `bench.config.json`)
+- [x] Step 6 — CLI variables set (values in `03-cli-variables.md`)
+- [x] Step 7.1 — Create GlobalStandard deployment (tokens-only billing)
+- [x] Record 7.1 outputs (endpoint, state) into config and variables file
+- [x] Validate runner client and executor against live endpoint (streaming and non-streaming)
+- [ ] Capture automatic `results/<run-id>/pip-freeze.txt` on the first live run
+- [x] Verify Azure OpenAI v1 data-plane API and endpoint
+- [x] Step 7.2 — Create provisioned deployment (**$45/hr billing active**)
+- [x] Record 7.2 outputs (state, timestamp) into config and variables file
+- [x] Step 7.3 — Verify deployment parity and both request modes
+- [x] Fix stale over-budget test and hanging async deadline test
+- [x] Run full test suite (`python -m unittest test_app`) — 30 tests pass
+- [x] Revise the matrix to fit the measurement window
+- [x] Pass the fully resolved 24-scenario / 144-run dry-run
+- [ ] Steps 9-10 — Run measurement passes and export Azure metrics
+- [ ] Step 14 — Delete provisioned deployment (**stop billing**)
+- [ ] Steps 11-13 — Analyze results
+- [ ] Step 14 — Delete baseline deployment
+
+---
+
 Runbook: [03-ptuVSpaygo.md](03-ptuVSpaygo.md)
-Date: 2026-07-28 (last updated)
+Date: 2026-07-28 17:52 UTC (last updated)
 
 ## Status at a glance
 
-Everything so far is **read-only or local**. No Azure resources exist and nothing is
-billing — a live check of `ptu-benchmarks-resource` on 2026-07-28 returns zero
-deployments.
+Both deployments are `Succeeded/Running`. The 45-PTU
+`gpt-5.6-sol-provisioned` deployment was created on 2026-07-28 at 17:49 UTC;
+**$45/hour billing is active until that deployment is deleted.** Azure OpenAI v1
+non-streaming and streaming requests pass through the runner's real client and
+executor on both deployments.
 
-The runbook runs in [phase order, not numeric order](03-ptuVSpaygo.md): the runner
-(section 8) is built before anything is deployed (sections 6-7).
+The post-deployment parity smoke returned `200` for both deployments in both modes:
+
+| Deployment | Mode | Total latency | TTFT | Usage |
+|---|---|---:|---:|---:|
+| Global Standard | Non-streaming | 3.124 s | — | 74 in / 64 out |
+| Provisioned | Non-streaming | 1.419 s | — | 74 in / 64 out |
+| Global Standard | Streaming | 1.187 s | 0.704 s | 74 in / 64 out |
+| Provisioned | Streaming | 1.336 s | 1.221 s | 74 in / 64 out |
+
+Both streaming responses contained 61 content chunks. These excluded diagnostics
+prove authentication, request, usage, and TTFT paths only; they are not benchmark
+measurements.
 
 | Phase | Runbook step | Status |
 |---|---|---|
-| 1. Plan | 1-3 | Done, except the contract placeholders below |
+| 1. Plan | 1-3 | Done |
 | 2. Discover | 4-5 | Done — model, SKUs, quota, capacity, and prices confirmed live |
-| 3. Build | 8 | Runner written; never run against a live endpoint |
-| 4. Baseline deploy | 6, 7.1 | Not started |
-| 5. Validate | 8 | Not started |
-| 6-10 | 7.2-7.3, 9-14 | Not started |
+| 3. Build | 8 | Runner complete; 30 local tests pass in about 1.5 seconds |
+| 4. Baseline deploy | 6, 7.1 | **Done** — `gpt-5.6-sol-global-standard` deployed 2026-07-28T16:43:06Z |
+| 5. Validate | 8 | Client/executor smoke passed on both deployments; artifact-producing run remains |
+| 6. Provision | 7.2-7.3 | **Done** — 45 PTU created, parity verified |
+| 7-10 | 9-14 | Measurement, metrics, analysis, and cleanup not started |
 
-**Open gate:** step 7.1 creates the first billable deployment (tokens only); step 7.2
-starts hourly PTU billing. Approval for the Azure bill is still required.
+**Active cost:** PTU billing started at 2026-07-28T17:49:01Z. The current retail
+meter is $1.00/PTU/hour, so 45 PTU costs $45/hour until deletion. The deployment
+name and parity metadata are resolved, and the matrix fits its configured limit.
+
+The GlobalStandard deployment bills per token only and costs nothing while idle.
 
 ## Environment and target
 
@@ -42,16 +83,9 @@ splits the two deployment types across separate Foundry resources.
 
 All three candidates are version `2026-07-09`.
 
-| Model | Provisioned SKU | Verdict |
-|---|---|---|
-| `gpt-5.6-luna` | none | Rejected — no provisioned side to compare |
-| `gpt-5.6-sol` | `GlobalProvisionedManaged` | **Selected** |
-| `gpt-5.6-terra` | `DataZoneProvisionedManaged` only | Rejected — routing mismatch |
-
-`gpt-5.6-sol` wins because its baseline and provisioned SKUs are **both globally
-routed**, so the runbook's routing-asymmetry caveat does not apply. `terra` is half
-the token price with double the PTU efficiency, but would have forced either a routing
-confound or a deviation from the `GlobalStandard` baseline.
+`gpt-5.6-sol` was selected because its baseline and provisioned SKUs are **both
+globally routed** (`GlobalStandard` and `GlobalProvisionedManaged`), so the
+runbook's routing-asymmetry caveat does not apply.
 
 Live quota (swedencentral) and SKU limits:
 
@@ -93,9 +127,12 @@ step 10), or 1.28x headroom.
 | Baseline | `GlobalStandard`, capacity 30 (30,000 TPM) |
 | Provisioned | `GlobalProvisionedManaged`, capacity 45 PTU |
 | Workload | 18 RPM, 1000 in / 300 out |
-| API version | `2026-05-01-preview` — assumed, not yet verified |
-| Endpoint / deployment names | Placeholders — fill after steps 7.1-7.3 |
-| Runner version / seed | `1.0.0` / `20260727` |
+| Data-plane API | Azure OpenAI v1 — verified live; no `api-version` query |
+| Endpoint / deployment names | GS: `gpt-5.6-sol-global-standard`; PTU: `gpt-5.6-sol-provisioned`; endpoint: `https://ptu-benchmarks-resource.openai.azure.com/` |
+| Client location | GitHub Codespaces dev container; host region is not exposed |
+| Generation policy | `max_completion_tokens` with `reasoning_effort: none` |
+| Runner version / seed | `1.2.0` / `20260727` |
+| Maximum runner wall time | 145 minutes, including warm-up and request drain |
 
 ## Cost
 
@@ -139,9 +176,8 @@ Pricing alone already answers the runbook's step 11 question:
 | 1-year reservation | $13.62 | ~16% better |
 
 **At full utilization, hourly PTU costs 2.8x more than pay-as-you-go for this workload
-shape.** PTU only becomes competitive under a reservation. `terra` produces the same
-~3x ratio despite half the token price and double the PTU efficiency — the two effects
-cancel — so the finding is **structural, not model-specific**.
+shape.** PTU only becomes competitive under a reservation. The finding is
+**structural, not model-specific**.
 
 This does not invalidate the benchmark. Latency, TTFT, throttling, and saturation
 shape are the real deliverables, and PTU should win clearly on p95/p99 and 429 rate.
@@ -153,68 +189,74 @@ Capped at three billed hours, ~$185-225.
 
 | Window | Activity |
 |---|---|
-| 0-10 min | Create both deployments, verify parity, smoke test |
+| 0-10 min | Create PTU deployment, verify parity, smoke test |
 | 10-155 min | Measurement passes |
 | 155-170 min | Export results, aggregates, and manifest |
 | 170-180 min | Delete both deployments |
 
-The full matrix fits, so no scenarios are dropped:
+The checked-in matrix fits within the 145-minute measurement window and includes
+both a low and a target-rate streaming pass.
 
-| Pass | Levels | Runs (x2 deployments, x3 trials) |
+| Pass | Levels | Runs (x3 workloads, x2 deployments, x3 trials) |
 |---|---|---|
-| Concurrency sweep | 1, 2, 4, 8, 16, 32 | 36 |
-| Offered-load sweep | 9, 18, 27 RPM | 18 |
-| TTFT pass (streaming) | 4, 18 RPM | 12 |
-| **Total** | 11 scenarios | **66 runs** |
+| Concurrency sweep | 1, 8, 32 | 54 |
+| Offered-load sweep | 9, 18, 27 RPM | 54 |
+| TTFT pass (streaming) | 9, 18 RPM | 36 |
+| **Total** | 24 scenarios | **144 runs** |
 
-`--dry-run` estimates **102 minutes** at `trial_duration_s: 90` plus a 3 s pause,
-inside the 145-minute window — roughly 40 minutes of slack. Warm-up runs once per
-deployment per workload.
+At `trial_duration_s: 50` plus a 3 s pause, nominal time is **127.2 minutes**, leaving
+about 17.6 minutes of execution headroom for warm-up and request drain.
 
-Trial length was raised from 60 s to 90 s because longer trials cost **no extra PTU**
-(PTU bills on deployment lifetime, not trial length) and buy sample count. 120 s was
-rejected: it needs 135 of the 145 minutes, leaving no room for a stall or restart
-before the run eats into the export slot while PTU bills. If a run still overruns,
-drop `trials` from 3 to 2 rather than extending the window, and record the deviation
-in the manifest.
-
-**Accepted limitation:** a 90-second trial at concurrency 1 yields only ~45 requests,
-so p99 is not credible there. Report p50 and p90 at low concurrency and reserve
-p95/p99 claims for the high-concurrency passes. The runner flags this itself — any
-scenario under 100 successful samples gets a `sample_warning` in its aggregate.
+**Accepted limitation:** short or low-rate trials will not produce credible p99s.
+Report p50 and p90 at low sample counts and reserve p95/p99 claims for passes with
+enough observations. Any scenario under 100 successful samples receives a
+`sample_warning` in its aggregate.
 
 ## Runner state
 
 | Artifact | State |
 |---|---|
-| `app.py` | 873 lines, runner version `1.0.0` |
-| `bench.config.json` | Full 11-scenario matrix; endpoint and deployment names are placeholders |
-| `.venv/` | `openai 2.48.0`, `azure-identity 1.25.3`, `httpx 0.28.1`, `tiktoken 0.13.0` |
+| `app.py` | Runner version `1.2.0`; Azure OpenAI v1 client and bounded open-loop worker pool |
+| `test_app.py` | 30 tests pass in about 1.5 seconds, including deadline and checkpoint coverage |
+| `bench.config.json` | 24-scenario matrix; verified v1 endpoint and both deployment names filled |
+| `.venv/` | `openai 2.48.0`, `azure-identity 1.25.3`, `aiohttp 3.14.3`, `httpx 0.28.1`, `tiktoken 0.13.0` |
 | `results/` | Does not exist — no run has produced output |
 
-Covers the section 8 checklist: Entra ID auth only, excluded warm-up, closed- and
-open-loop sweeps, a streaming TTFT pass, alternating deployment order, seeded case
-order, per-request results, percentile aggregates, error and throttle classification,
-and an immutable manifest. Deployment names are configuration, not code.
+Covers the section 8 checklist: Entra ID auth only, excluded fail-fast warm-up,
+closed- and open-loop sweeps, a streaming TTFT pass, alternating deployment order,
+seeded case order, per-request results, percentile aggregates, explicit UTC trial
+windows, error/throttle classification, peak client backlog, and an immutable
+manifest. Deployment names are configuration, not code.
+
+Open-loop scheduling uses exactly `max_in_flight` long-lived workers and a compact
+arrival queue rather than one asyncio task per request. Completed trial aggregates
+are atomically checkpointed, and graceful deadline cancellation records the active
+trial as partial.
+
+Streaming cadence is reported as mean output-token interval using completion-token
+usage and the first/last content-bearing events; stream chunks are not treated as
+tokens. Open-loop arrival rate uses the scheduled arrival window, while completion
+and token throughput use total elapsed time including request drain.
 
 **Retries are disabled by design.** Neither the SDK nor the runner retries, so a 429
-is recorded as a result rather than hidden behind a backoff. The unused retry loop and
-its per-request fields were removed on 2026-07-28.
+is recorded as a result rather than hidden behind a backoff. The runbook and manifest
+now make this one-attempt policy explicit.
 
 ### Outstanding
 
-1. **Never run against a live endpoint.** `--dry-run` passes — config parses and the
-   11 scenarios build — but it makes no network calls, so authentication, token
-   accounting, and TTFT detection are all unproven.
-2. **`results/pip-freeze.txt` not captured.** The runbook requires resolved SDK
-   versions in the manifest before measurement.
-3. **API version unverified.** `2026-05-01-preview` is assumed, not discovered.
+1. **Artifact-producing validation remains.** Direct calls through `build_client`
+   and `Executor` proved Entra authentication, token accounting, response validation,
+   and TTFT detection against both deployments. A normal CLI run is still needed
+   to exercise manifest and result-file creation together.
+2. **Dependency snapshot not yet produced.** Every normal non-dry invocation creates
+   `results/<run-id>/pip-freeze.txt` and records its digest before client creation;
+   no such invocation has occurred yet.
+3. **Client region is unavailable.** The Codespaces host exposes no authoritative
+   region value. This is disclosed in the manifest rather than guessed.
 
 ## Next step
 
-**Step 6 (CLI variables), then step 7.1** — create the GlobalStandard deployment only.
-Step 6 is non-mutating; 7.1 bills per token, so it is cheap and is the endpoint the
-runner must be validated against.
-
-Step 7.2 stays gated: it starts $45/hour billing at creation regardless of traffic —
-$135 across the approved window, plus $45 for every hour cleanup is late.
+Start the artifact-producing two-deployment measurement. Inspect the manifest,
+raw rows, and aggregate checkpoints before exporting Azure metrics. Delete
+`gpt-5.6-sol-provisioned` immediately after measurement and metric export; every
+additional hour costs $45.

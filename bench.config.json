@@ -1,21 +1,45 @@
 {
-  "endpoint": "<https://ptu-benchmarks-resource.openai.azure.com/ - fill from step 7.3>",
-  "api_version": "2026-05-01-preview",
+  "endpoint": "https://ptu-benchmarks-resource.openai.azure.com/",
+  "api_version": "v1",
+  "api_version_verified": true,
+
+  "experiment": {
+    "subscription_id": "9103cd46-543d-4b44-a957-f011acb997c6",
+    "tenant_id": "6ee29205-81b5-4e4b-b235-5bd9d6fb6b04",
+    "resource_group": "rg-foundry-customer-demos",
+    "foundry_resource": "ptu-benchmarks-resource",
+    "foundry_project": "ptu-benchmarks",
+    "model_name": "gpt-5.6-sol",
+    "model_version": "2026-07-09",
+    "model_format": "OpenAI",
+    "region": "swedencentral",
+    "client_location": "GitHub Codespaces dev container (region not exposed by host)",
+    "content_filter_policy": "Microsoft.DefaultV2",
+    "version_upgrade_policy": "NoAutoUpgrade",
+    "target_rpm": 18,
+    "routing_scope": "global for both deployment types",
+    "deployment_skus": {
+      "global-standard": { "name": "GlobalStandard", "capacity": 30 },
+      "provisioned": { "name": "GlobalProvisionedManaged", "capacity": 45 }
+    }
+  },
 
   "deployments": {
-    "global-standard": "<fill after step 7.1>",
-    "provisioned": "<fill after step 7.2>"
+    "global-standard": "gpt-5.6-sol-global-standard",
+    "provisioned": "gpt-5.6-sol-provisioned"
   },
 
   "seed": 20260727,
   "trials": 3,
-  "trial_duration_s": 60,
+  "trial_duration_s": 50,
   "inter_trial_pause_s": 3,
+  "max_run_duration_s": 8700,
+  "shutdown_grace_s": 10,
   "warmup_requests": 5,
 
   "concurrency_levels": [1, 8, 32],
   "offered_load_rpm": [9, 18, 27],
-  "streaming_load_rpm": [4, 18],
+  "streaming_load_rpm": [9, 18],
 
   "workloads": [
     { "name": "short-chat", "input_tokens": 200, "max_output_tokens": 100 },
@@ -25,11 +49,13 @@
 
   "generation": {
     "token_param": "max_completion_tokens",
-    "extra_params": {}
+    "extra_params": {
+      "reasoning_effort": "none"
+    }
   },
 
   "timeouts": { "connect_s": 10, "read_s": 180 },
-  "max_in_flight": 512,
+  "max_in_flight": 64,
 
   "output_dir": "results"
 }
