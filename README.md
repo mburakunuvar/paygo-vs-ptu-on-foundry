@@ -1,6 +1,6 @@
-# PayGo vs. PTU Benchmark on Microsoft Foundry
+# PayGo vs. PTU Benchmarks on Microsoft Foundry
 
-## PTU vs Pay-As-You-Go Benchmark
+## PTU vs Pay-As-You-Go 
 
 This project benchmarks **Provisioned Throughput (PTU)** against **Global Standard (Pay-As-You-Go)** deployments on the same Microsoft Foundry resource to compare latency, throughput, throttling, and cost under identical load.
 
