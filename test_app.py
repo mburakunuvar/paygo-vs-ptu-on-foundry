@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -19,7 +20,9 @@ from app import (
     Scenario,
     WarmupError,
     Workload,
+    _safe_error_message,
     aggregate,
+    build_client,
     build_scenarios,
     build_warmup_scenario,
     execute,
@@ -31,8 +34,104 @@ from app import (
     run_closed_loop,
     run_open_loop,
     warm_up,
+    write_dependency_snapshot,
     write_manifest,
 )
+
+
+# The published benchmark methodology, as environment variables. Identity values
+# are fictional; only the matrix and run-control numbers need to be faithful,
+# because the readiness and runtime assertions below pin them.
+CANONICAL_ENV = {
+    "AZURE_OPENAI_ENDPOINT": "https://benchmark-resource.openai.azure.com/",
+    "AZURE_OPENAI_API_VERSION": "v1",
+    "AZURE_OPENAI_API_VERSION_VERIFIED": "true",
+    "AZURE_SUBSCRIPTION_ID": "00000000-0000-0000-0000-000000000001",
+    "AZURE_TENANT_ID": "00000000-0000-0000-0000-000000000002",
+    "AZURE_RESOURCE_GROUP": "rg-benchmarks",
+    "AZURE_FOUNDRY_RESOURCE": "benchmark-resource",
+    "AZURE_FOUNDRY_PROJECT": "benchmarks",
+    "AZURE_DEPLOYMENT_GLOBAL_STANDARD": "model-global-standard",
+    "AZURE_DEPLOYMENT_PROVISIONED": "model-provisioned",
+    "BENCH_SKU_GLOBAL_STANDARD_NAME": "GlobalStandard",
+    "BENCH_SKU_GLOBAL_STANDARD_CAPACITY": "1350",
+    "BENCH_SKU_PROVISIONED_NAME": "GlobalProvisionedManaged",
+    "BENCH_SKU_PROVISIONED_CAPACITY": "45",
+    "BENCH_MODEL_NAME": "gpt-5.6-luna",
+    "BENCH_MODEL_VERSION": "2026-07-09",
+    "BENCH_MODEL_FORMAT": "OpenAI",
+    "BENCH_REGION": "swedencentral",
+    "BENCH_CLIENT_LOCATION": "test runner",
+    "BENCH_CONTENT_FILTER_POLICY": "Microsoft.DefaultV2",
+    "BENCH_VERSION_UPGRADE_POLICY": "NoAutoUpgrade",
+    "BENCH_ROUTING_SCOPE": "global for both deployment types",
+    "BENCH_TARGET_RPM": "480",
+    "BENCH_CONCURRENCY_LEVELS": "1,8,32",
+    "BENCH_OFFERED_LOAD_RPM": "240,480,720",
+    "BENCH_STREAMING_LOAD_RPM": "240,480",
+    "BENCH_WORKLOADS": json.dumps(
+        [
+            {"name": "short-chat", "input_tokens": 200, "max_output_tokens": 100},
+            {"name": "rag", "input_tokens": 1000, "max_output_tokens": 300},
+            {"name": "long-gen", "input_tokens": 500, "max_output_tokens": 1000},
+        ]
+    ),
+    "BENCH_SEED": "20260727",
+    "BENCH_TRIALS": "3",
+    "BENCH_TRIAL_DURATION_S": "50",
+    "BENCH_INTER_TRIAL_PAUSE_S": "3",
+    "BENCH_MAX_RUN_DURATION_S": "8700",
+    "BENCH_SHUTDOWN_GRACE_S": "10",
+    "BENCH_WARMUP_REQUESTS": "5",
+    "BENCH_CONNECT_TIMEOUT_S": "10",
+    "BENCH_READ_TIMEOUT_S": "180",
+    "BENCH_MAX_IN_FLIGHT": "64",
+    "BENCH_TOKEN_PARAM": "max_completion_tokens",
+    "BENCH_GENERATION_EXTRA_PARAMS": json.dumps({"reasoning_effort": "none"}),
+    "BENCH_OUTPUT_DIR": "results",
+}
+
+
+def canonical_env(**overrides):
+    """Canonical environment, with overrides applied. None removes a variable."""
+    env = dict(CANONICAL_ENV)
+    for name, value in overrides.items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
+    return env
+
+
+def canonical_config(**overrides):
+    return Config.from_env(canonical_env(**overrides))
+
+
+@contextlib.contextmanager
+def isolated_env(env):
+    """Expose exactly `env` as the AZURE_*/BENCH_* configuration.
+
+    Restoring os.environ wholesale (as patch.dict does) would drop any variable
+    whose value is the empty string, because Windows treats setting an empty
+    value as deletion in the real process environment. That silently breaks
+    subprocesses such as git, so only the configuration namespace is touched and
+    every mutated key is restored individually.
+    """
+    touched = {
+        key
+        for key in os.environ
+        if key.startswith(("AZURE_", "BENCH_"))
+    } | set(env)
+    saved = {key: os.environ[key] for key in touched if key in os.environ}
+    try:
+        for key in touched:
+            os.environ.pop(key, None)
+        os.environ.update(env)
+        yield
+    finally:
+        for key in touched:
+            os.environ.pop(key, None)
+        os.environ.update(saved)
 
 
 def request_result(**overrides):
@@ -159,6 +258,104 @@ class BenchmarkMetricTests(unittest.TestCase):
         self.assertEqual(summary["stream_completion_s"]["samples"], 2)
         self.assertEqual(summary["rates"]["invalid_response"], 0.3333)
         self.assertEqual(summary["rates"]["other_error"], 0.3333)
+
+
+class BenchmarkSecurityTests(unittest.TestCase):
+    def test_client_revalidates_endpoint_before_creating_credentials(self):
+        cfg = canonical_config(AZURE_OPENAI_ENDPOINT="https://example.com")
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "endpoint host is not a supported public Azure OpenAI domain",
+        ):
+            build_client(cfg)
+
+    def test_readiness_rejects_endpoints_that_could_expose_a_bearer_token(self):
+        cases = (
+            (
+                "http://benchmark-resource.openai.azure.com",
+                "endpoint must use HTTPS",
+            ),
+            (
+                "https://example.com",
+                "endpoint host is not a supported public Azure OpenAI domain",
+            ),
+            (
+                "https://" + "user:placeholder@"
+                "benchmark-resource.openai.azure.com",
+                "endpoint must not include credentials",
+            ),
+            (
+                "https://benchmark-resource.openai.azure.com/openai/v1",
+                "endpoint must be a resource root without a path, query, or fragment",
+            ),
+            (
+                "https://benchmark-resource.openai.azure.com:8443",
+                "endpoint must use the default HTTPS port",
+            ),
+        )
+
+        for endpoint, expected_error in cases:
+            with self.subTest(endpoint=endpoint):
+                errors = readiness_errors(
+                    canonical_config(AZURE_OPENAI_ENDPOINT=endpoint),
+                    ["global-standard"],
+                )
+                self.assertIn(expected_error, errors)
+
+    def test_readiness_accepts_public_azure_endpoint(self):
+        cfg = canonical_config(
+            AZURE_OPENAI_ENDPOINT=(
+                "https://benchmark-resource.openai.azure.com/"
+            )
+        )
+
+        self.assertEqual(readiness_errors(cfg, ["global-standard"]), [])
+
+    def test_recorded_errors_redact_credentials_and_control_characters(self):
+        authorization = (
+            "Authorization" + ": Bearer " + "header.payload.signature"
+        )
+        api_key = "api_" + "key=placeholder-one"
+        password = "pass" + "word='placeholder-two'"
+        json_secret = '"client_' + 'secret":"placeholder-three"'
+        private_key = (
+            "-----BEGIN " + "PRIVATE KEY-----\nplaceholder\n"
+            "-----END " + "PRIVATE KEY-----"
+        )
+        message = _safe_error_message(
+            RuntimeError(
+                f"{authorization}\n{api_key}; {password}; {json_secret}"
+                f"\x1b[31m {private_key}"
+            )
+        )
+
+        self.assertNotIn("header.payload.signature", message)
+        self.assertNotIn("placeholder-one", message)
+        self.assertNotIn("placeholder-two", message)
+        self.assertNotIn("placeholder-three", message)
+        self.assertNotIn("PRIVATE KEY-----", message)
+        self.assertNotIn("\n", message)
+        self.assertNotIn("\x1b", message)
+        self.assertIn("<redacted>", message)
+
+    def test_readiness_rejects_credentials_in_generation_parameters(self):
+        cfg = canonical_config(
+            BENCH_GENERATION_EXTRA_PARAMS=json.dumps(
+                {
+                    "temperature": 0.2,
+                    "metadata": {"client_secret": "placeholder"},
+                }
+            )
+        )
+
+        errors = readiness_errors(cfg, ["global-standard"])
+
+        self.assertIn(
+            "generation.extra_params must not contain credential fields: "
+            "generation.extra_params.metadata.client_secret",
+            errors,
+        )
 
 
 class BenchmarkAsyncTests(unittest.IsolatedAsyncioTestCase):
@@ -863,36 +1060,70 @@ class BenchmarkAsyncTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BenchmarkManifestTests(unittest.TestCase):
-    def test_config_rejects_lossy_numeric_coercion(self):
-        original = json.loads(Path("bench.config.json").read_text())
-        invalid_values = (
-            ("trials", True),
-            ("warmup_requests", 1.9),
-            ("max_in_flight", True),
-        )
+    def test_dependency_snapshot_records_versions_without_source_urls(self):
+        completed = SimpleNamespace(stdout="example-package==1.2.3\n")
+
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "config.json"
-            for field, value in invalid_values:
-                with self.subTest(field=field):
-                    raw = dict(original)
-                    raw[field] = value
-                    path.write_text(json.dumps(raw))
-                    with self.assertRaisesRegex(ValueError, field):
-                        Config.load(path)
+            with patch("app.subprocess.run", return_value=completed) as run:
+                snapshot = write_dependency_snapshot(Path(directory))
+
+            content = (Path(directory) / snapshot["file"]).read_text(
+                encoding="utf-8"
+            )
+
+        self.assertEqual(snapshot["file"], "pip-packages.txt")
+        self.assertEqual(content, "example-package==1.2.3\n")
+        run.assert_called_once_with(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "list",
+                "--format=freeze",
+                "--disable-pip-version-check",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_config_rejects_lossy_numeric_coercion(self):
+        invalid_values = (
+            ("BENCH_TRIALS", "true"),
+            ("BENCH_WARMUP_REQUESTS", "1.9"),
+            ("BENCH_MAX_IN_FLIGHT", "true"),
+            ("BENCH_TRIAL_DURATION_S", "fast"),
+            ("BENCH_CONCURRENCY_LEVELS", "1,8,thirty-two"),
+            ("AZURE_OPENAI_API_VERSION_VERIFIED", "maybe"),
+            ("BENCH_WORKLOADS", "not-json"),
+        )
+        for name, value in invalid_values:
+            with self.subTest(field=name):
+                with self.assertRaisesRegex(ValueError, name):
+                    Config.from_env(canonical_env(**{name: value}))
+
+    def test_config_reports_missing_workload_fields_clearly(self):
+        workloads = json.dumps(
+            [{"name": "rag", "input_tokens": 1000}]
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "workload is missing required field.*max_output_tokens",
+        ):
+            Config.from_env(canonical_env(BENCH_WORKLOADS=workloads))
 
     def test_manifest_records_reproducibility_contract(self):
-        cfg = Config.load(Path("bench.config.json"))
+        cfg = canonical_config()
         with tempfile.TemporaryDirectory() as directory:
             out_dir = Path(directory)
-            external_config = out_dir / "external-config.json"
-            external_config.write_text(Path("bench.config.json").read_text())
             write_manifest(
                 cfg,
                 ["global-standard"],
                 "run",
                 out_dir,
-                external_config,
-                {"file": "pip-freeze.txt", "sha256": "digest"},
+                ".env",
+                {"file": "pip-packages.txt", "sha256": "digest"},
             )
             manifest = json.loads((out_dir / "manifest.json").read_text())
 
@@ -900,23 +1131,83 @@ class BenchmarkManifestTests(unittest.TestCase):
         self.assertEqual(len(manifest["source"]["commit"]), 40)
         self.assertEqual(len(manifest["runner_sha256"]), 64)
         self.assertEqual(len(manifest["config_sha256"]), 64)
+        self.assertEqual(manifest["config_source"], ".env")
         self.assertIn("experiment", manifest)
         self.assertEqual(manifest["retry_policy"]["attempts_per_request"], 1)
         self.assertEqual(manifest["config"]["max_run_duration_s"], 8700)
         self.assertEqual(manifest["config"]["max_in_flight"], 64)
         self.assertEqual(manifest["dependency_snapshot"]["sha256"], "digest")
+        self.assertEqual(manifest["client"]["executable"], Path(sys.executable).name)
+
+    def test_manifest_defensively_redacts_sensitive_generation_fields(self):
+        cfg = replace(
+            canonical_config(),
+            extra_generation_params={
+                "metadata": {"access_token": "placeholder"}
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            out_dir = Path(directory)
+            write_manifest(
+                cfg,
+                ["global-standard"],
+                "run",
+                out_dir,
+                ".env",
+                {"file": "pip-packages.txt", "sha256": "digest"},
+            )
+            raw_manifest = (out_dir / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+            manifest = json.loads(raw_manifest)
+
+        self.assertNotIn("placeholder", raw_manifest)
+        self.assertEqual(
+            manifest["config"]["extra_generation_params"]["metadata"][
+                "access_token"
+            ],
+            "<redacted>",
+        )
+
+    def test_config_digest_tracks_the_effective_values(self):
+        def digest(cfg):
+            with tempfile.TemporaryDirectory() as directory:
+                out_dir = Path(directory)
+                write_manifest(
+                    cfg,
+                    ["global-standard"],
+                    "run",
+                    out_dir,
+                    ".env",
+                    {"file": "pip-packages.txt", "sha256": "digest"},
+                )
+                return json.loads(
+                    (out_dir / "manifest.json").read_text()
+                )["config_sha256"]
+
+        baseline = digest(canonical_config())
+
+        self.assertEqual(baseline, digest(canonical_config()))
+        self.assertNotEqual(baseline, digest(canonical_config(BENCH_SEED="1")))
+        self.assertNotEqual(
+            baseline, digest(canonical_config(BENCH_CONCURRENCY_LEVELS="1,8"))
+        )
+        self.assertNotEqual(
+            baseline, digest(canonical_config(BENCH_MODEL_VERSION="2026-01-01"))
+        )
 
     def test_current_full_matrix_fits_with_operational_slack(self):
-        cfg = Config.load(Path("bench.config.json"))
+        cfg = canonical_config()
 
         errors = readiness_errors(cfg, list(cfg.deployments))
 
+        self.assertEqual(errors, [])
         self.assertEqual(len(build_scenarios(cfg)), 24)
         self.assertEqual(nominal_runtime_s(cfg, list(cfg.deployments)), 7632)
-        self.assertFalse(any("nominal matrix time" in error for error in errors))
 
     def test_readiness_requires_baseline_and_target_load_coverage(self):
-        cfg = Config.load(Path("bench.config.json"))
+        cfg = canonical_config()
         cfg = replace(
             cfg,
             concurrency_levels=(8, 32),
@@ -937,37 +1228,156 @@ class BenchmarkManifestTests(unittest.TestCase):
             errors,
         )
 
+    def test_full_comparison_requires_both_reference_deployments(self):
+        cfg = Config.from_env(
+            canonical_env(
+                AZURE_DEPLOYMENT_PROVISIONED=None,
+                BENCH_SKU_PROVISIONED_NAME=None,
+                BENCH_SKU_PROVISIONED_CAPACITY=None,
+            )
+        )
+
+        full_run_errors = readiness_errors(
+            cfg,
+            list(cfg.deployments),
+            require_reference_pair=True,
+        )
+
+        self.assertIn(
+            "full comparison is missing deployment label(s): provisioned; "
+            "set AZURE_DEPLOYMENT_PROVISIONED",
+            full_run_errors,
+        )
+        self.assertEqual(
+            readiness_errors(cfg, ["global-standard"]),
+            [],
+        )
+
     def test_dry_run_reports_readiness_errors_without_network_calls(self):
         output = io.StringIO()
         errors = io.StringIO()
-        raw_config = json.loads(Path("bench.config.json").read_text())
-        raw_config["deployments"]["provisioned"] = "<unresolved>"
+        env = canonical_env(AZURE_DEPLOYMENT_PROVISIONED="<unresolved>")
 
-        with tempfile.TemporaryDirectory() as directory:
-            config_path = Path(directory) / "bench.config.json"
-            config_path.write_text(json.dumps(raw_config))
-            with (
-                patch.object(
-                    sys,
-                    "argv",
-                    ["app.py", "--config", str(config_path), "--dry-run"],
-                ),
-                patch(
-                    "app.build_client",
-                    side_effect=AssertionError("dry run contacted the network"),
-                ),
-                contextlib.redirect_stdout(output),
-                contextlib.redirect_stderr(errors),
-            ):
-                exit_code = main()
+        with (
+            isolated_env(env),
+            patch.object(
+                sys,
+                "argv",
+                ["app.py", "--no-env-file", "--dry-run"],
+            ),
+            patch(
+                "app.build_client",
+                side_effect=AssertionError("dry run contacted the network"),
+            ),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            exit_code = main()
 
         self.assertEqual(exit_code, 2)
         self.assertIn("dry-run readiness failed", errors.getvalue())
         self.assertIn("deployment name is unresolved for provisioned", errors.getvalue())
         self.assertIn("no network calls made", output.getvalue())
 
+    def test_dry_run_names_the_environment_variables_that_are_unset(self):
+        output = io.StringIO()
+        errors = io.StringIO()
+        env = canonical_env(
+            AZURE_OPENAI_ENDPOINT=None,
+            AZURE_SUBSCRIPTION_ID=None,
+            BENCH_SKU_PROVISIONED_CAPACITY=None,
+        )
+
+        with (
+            isolated_env(env),
+            patch.object(
+                sys,
+                "argv",
+                ["app.py", "--no-env-file", "--dry-run"],
+            ),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            exit_code = main()
+
+        reported = errors.getvalue()
+        self.assertEqual(exit_code, 2)
+        self.assertIn("endpoint is unresolved", reported)
+        self.assertIn("experiment.subscription_id is unresolved", reported)
+        self.assertIn("unset environment variables:", reported)
+        self.assertIn("AZURE_OPENAI_ENDPOINT", reported)
+        self.assertIn("AZURE_SUBSCRIPTION_ID", reported)
+        self.assertIn("BENCH_SKU_PROVISIONED_CAPACITY", reported)
+        self.assertNotIn("AZURE_TENANT_ID\n", reported)
+        self.assertIn("no network calls made", output.getvalue())
+
+    def test_environment_overrides_the_dotenv_file(self):
+        env_file_body = "\n".join(
+            f"{name}={value}" for name, value in canonical_env().items()
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env"
+            env_path.write_text(env_file_body, encoding="utf-8")
+            with (
+                isolated_env({"BENCH_MAX_IN_FLIGHT": "7"}),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["app.py", "--env-file", str(env_path), "--dry-run"],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                exit_code = main()
+                cfg = Config.from_env()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(cfg.max_in_flight, 7)
+        self.assertEqual(cfg.seed, 20260727)
+        self.assertEqual(cfg.deployments["provisioned"], "model-provisioned")
+
+    def test_explicit_missing_dotenv_file_is_rejected(self):
+        errors = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as directory:
+            missing_path = Path(directory) / "missing.env"
+            with (
+                isolated_env(canonical_env()),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["app.py", "--env-file", str(missing_path), "--dry-run"],
+                ),
+                contextlib.redirect_stderr(errors),
+            ):
+                exit_code = main()
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("dotenv file not found", errors.getvalue())
+
+    def test_deployment_labels_come_from_the_environment(self):
+        cfg = Config.from_env(
+            canonical_env(
+                AZURE_DEPLOYMENT_DATA_ZONE="model-data-zone",
+                BENCH_SKU_DATA_ZONE_NAME="DataZoneStandard",
+                BENCH_SKU_DATA_ZONE_CAPACITY="20",
+            )
+        )
+
+        self.assertEqual(
+            sorted(cfg.deployments),
+            ["data-zone", "global-standard", "provisioned"],
+        )
+        self.assertEqual(cfg.deployments["data-zone"], "model-data-zone")
+        self.assertEqual(
+            cfg.experiment["deployment_skus"]["data-zone"],
+            {"name": "DataZoneStandard", "capacity": 20},
+        )
+        self.assertEqual(readiness_errors(cfg, ["data-zone"]), [])
+
     def test_readiness_rejects_zero_warmup_and_incomplete_sku_metadata(self):
-        cfg = Config.load(Path("bench.config.json"))
+        cfg = canonical_config()
         cfg = replace(
             cfg,
             warmup_requests=0,
@@ -985,7 +1395,7 @@ class BenchmarkManifestTests(unittest.TestCase):
         )
 
     def test_readiness_requires_three_trials_and_rejects_reserved_extras(self):
-        cfg = Config.load(Path("bench.config.json"))
+        cfg = canonical_config()
         cfg = replace(
             cfg,
             trials=1,
@@ -1037,7 +1447,7 @@ class BenchmarkManifestTests(unittest.TestCase):
         self.assertTrue(stopped["forced"])
 
     def test_readiness_rejects_empty_and_nonpositive_matrix_values(self):
-        cfg = Config.load(Path("bench.config.json"))
+        cfg = canonical_config()
         cfg = replace(
             cfg,
             workloads=(),
@@ -1060,7 +1470,7 @@ class BenchmarkManifestTests(unittest.TestCase):
         )
 
     def test_readiness_rejects_null_metadata_and_nonobject_skus(self):
-        cfg = Config.load(Path("bench.config.json"))
+        cfg = canonical_config()
         cfg = replace(
             cfg,
             api_version_verified="true",
@@ -1074,7 +1484,7 @@ class BenchmarkManifestTests(unittest.TestCase):
                 "deployment_skus": {
                     "global-standard": {
                         "name": "GlobalStandard",
-                        "capacity": 30,
+                        "capacity": 1350,
                     },
                     "provisioned": {
                         "name": "GlobalStandard",

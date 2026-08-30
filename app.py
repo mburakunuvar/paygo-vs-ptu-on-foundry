@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """Benchmark runner: Global Standard (pay-as-you-go) vs. provisioned throughput.
 
-Implements section 8 of 03-ptuVSpaygo.md. Deployment names are configuration,
-not code, so the same binary runs the validation phase (pay-as-you-go only) and
-the measurement phase (both deployments) without touching a code path for the
-first time while provisioned capacity is billing.
+Deployment names are configuration, not code, so the same runner handles both
+the pay-as-you-go validation phase and the full comparison documented in
+README.md.
 
 Authentication is Microsoft Entra ID only. No API keys are read or written.
 
 Usage:
-    ./.venv/bin/python app.py --config bench.config.json --dry-run
-    ./.venv/bin/python app.py --config bench.config.json --only global-standard
-    ./.venv/bin/python app.py --config bench.config.json
+    python app.py --dry-run
+    python app.py --only global-standard
+    python app.py
+
+Configuration comes from the environment. Copy .env.example to .env and fill it
+in, or export the same variables directly; real environment variables take
+precedence over .env entries.
 """
 
 from __future__ import annotations
@@ -22,8 +25,10 @@ import hashlib
 import json
 import math
 import multiprocessing
+import os
 import platform
 import random
+import re
 import subprocess
 import sys
 import time
@@ -31,9 +36,10 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
+from urllib.parse import urlsplit
 
-RUNNER_VERSION = "1.2.0"
+RUNNER_VERSION = "1.3.0"
 
 SYSTEM_MESSAGE = (
     "You are a benchmarking assistant. Answer the user's request directly and "
@@ -66,16 +72,227 @@ def _config_int(value: Any, path: str) -> int:
     return value
 
 
-def _config_number(value: Any, path: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{path} must be a number")
-    return float(value)
-
-
 def _config_list(value: Any, path: str) -> list[Any]:
     if not isinstance(value, list):
         raise ValueError(f"{path} must be an array")
     return value
+
+
+DEPLOYMENT_ENV_PREFIX = "AZURE_DEPLOYMENT_"
+SKU_ENV_PREFIX = "BENCH_SKU_"
+DEFAULT_DEPLOYMENT_LABELS = ("global-standard", "provisioned")
+AZURE_OPENAI_HOST_SUFFIX = ".openai.azure.com"
+ALLOWED_TOKEN_PARAMS = {"max_completion_tokens", "max_tokens"}
+SENSITIVE_KEY_MARKERS = {
+    "accesstoken",
+    "accountkey",
+    "apikey",
+    "authorization",
+    "connectionstring",
+    "credential",
+    "password",
+    "privatekey",
+    "refreshtoken",
+    "secret",
+    "sharedaccesssignature",
+}
+
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)(?P<quote>[\"']?)\b(?P<key>"
+    r"authorization|api[-_ ]?key|account[-_ ]?key|client[-_ ]?secret|"
+    r"access[-_ ]?token|refresh[-_ ]?token|connection[-_ ]?string|"
+    r"password|private[-_ ]?key|shared[-_ ]?access[-_ ]?signature|sig"
+    r")(?P=quote)(?P<separator>\s*[:=]\s*)"
+    r"(?:bearer\s+)?(?:\"[^\"]*\"|'[^']*'|[^\s,;&}\]]+)"
+)
+_BEARER_TOKEN_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?"
+    r"-----END [A-Z ]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+
+
+def _parse_int(raw: str, path: str) -> int:
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{path} must be an integer") from None
+
+
+def _parse_float(raw: str, path: str) -> float:
+    try:
+        return float(raw)
+    except ValueError:
+        raise ValueError(f"{path} must be a number") from None
+
+
+def _parse_scalar_number(raw: str, path: str) -> int | float:
+    """Keep whole numbers as ints so manifests read 30 rather than 30.0."""
+    try:
+        return int(raw)
+    except ValueError:
+        return _parse_float(raw, path)
+
+
+def _env_text(env: Mapping[str, str], name: str) -> str | None:
+    raw = env.get(name)
+    if raw is None:
+        return None
+    return raw.strip() or None
+
+
+def _env_int(env: Mapping[str, str], name: str, default: int) -> int:
+    raw = _env_text(env, name)
+    return default if raw is None else _parse_int(raw, name)
+
+
+def _env_number(env: Mapping[str, str], name: str, default: float) -> float:
+    raw = _env_text(env, name)
+    return default if raw is None else _parse_float(raw, name)
+
+
+def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
+    raw = _env_text(env, name)
+    if raw is None:
+        return default
+    lowered = raw.lower()
+    if lowered in {"true", "1", "yes", "on"}:
+        return True
+    if lowered in {"false", "0", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
+def _env_json(env: Mapping[str, str], name: str, default: Any) -> Any:
+    raw = _env_text(env, name)
+    if raw is None:
+        return default
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} must be valid JSON: {exc.msg}") from None
+
+
+def _env_items(env: Mapping[str, str], name: str) -> list[str] | None:
+    raw = _env_text(env, name)
+    if raw is None:
+        return None
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _env_ints(
+    env: Mapping[str, str], name: str, default: Sequence[int]
+) -> list[int]:
+    items = _env_items(env, name)
+    if items is None:
+        return list(default)
+    return [_parse_int(item, f"{name}[{i}]") for i, item in enumerate(items)]
+
+
+def _env_numbers(
+    env: Mapping[str, str], name: str, default: Sequence[float]
+) -> list[float]:
+    items = _env_items(env, name)
+    if items is None:
+        return list(default)
+    return [_parse_float(item, f"{name}[{i}]") for i, item in enumerate(items)]
+
+
+def _env_label(suffix: str) -> str:
+    return suffix.lower().replace("_", "-")
+
+
+def _label_suffix(label: str) -> str:
+    return label.upper().replace("-", "_")
+
+
+def _normalized_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value).lower())
+
+
+def _is_sensitive_key(value: Any) -> bool:
+    normalized = _normalized_key(value)
+    return normalized == "sig" or any(
+        marker in normalized for marker in SENSITIVE_KEY_MARKERS
+    )
+
+
+def _sensitive_key_paths(value: Any, prefix: str) -> list[str]:
+    if isinstance(value, dict):
+        paths: list[str] = []
+        for key, child in value.items():
+            path = f"{prefix}.{key}"
+            if _is_sensitive_key(key):
+                paths.append(path)
+            else:
+                paths.extend(_sensitive_key_paths(child, path))
+        return paths
+    if isinstance(value, list):
+        paths = []
+        for index, child in enumerate(value):
+            paths.extend(_sensitive_key_paths(child, f"{prefix}[{index}]"))
+        return paths
+    return []
+
+
+def _redact_sensitive_values(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: (
+                "<redacted>"
+                if _is_sensitive_key(key)
+                else _redact_sensitive_values(child)
+            )
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive_values(child) for child in value]
+    return value
+
+
+def _endpoint_validation_error(endpoint: str) -> str | None:
+    try:
+        parsed = urlsplit(endpoint)
+        port = parsed.port
+    except ValueError:
+        return "endpoint must be a valid URL"
+
+    if parsed.scheme.lower() != "https":
+        return "endpoint must use HTTPS"
+    if parsed.username is not None or parsed.password is not None:
+        return "endpoint must not include credentials"
+
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if not (
+        hostname.endswith(AZURE_OPENAI_HOST_SUFFIX)
+        and hostname != AZURE_OPENAI_HOST_SUFFIX.removeprefix(".")
+    ):
+        return "endpoint host is not a supported public Azure OpenAI domain"
+    if port not in (None, 443):
+        return "endpoint must use the default HTTPS port"
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        return "endpoint must be a resource root without a path, query, or fragment"
+    return None
+
+
+def _safe_error_message(exc: BaseException) -> str:
+    message = _PRIVATE_KEY_RE.sub("<redacted private key>", str(exc))
+    message = _SECRET_ASSIGNMENT_RE.sub(
+        lambda match: (
+            f"{match.group('quote')}{match.group('key')}"
+            f"{match.group('quote')}{match.group('separator')}<redacted>"
+        ),
+        message,
+    )
+    message = _BEARER_TOKEN_RE.sub("Bearer <redacted>", message)
+    message = "".join(
+        character
+        if ord(character) >= 32 and ord(character) != 127
+        else " "
+        for character in message
+    )
+    return " ".join(message.split())[:400]
 
 
 @dataclass(frozen=True)
@@ -88,6 +305,13 @@ class Workload:
     def from_dict(d: dict[str, Any]) -> "Workload":
         if not isinstance(d, dict):
             raise ValueError("each workload must be an object")
+        required_fields = {"name", "input_tokens", "max_output_tokens"}
+        missing_fields = sorted(required_fields.difference(d))
+        if missing_fields:
+            raise ValueError(
+                "workload is missing required field(s): "
+                + ", ".join(missing_fields)
+            )
         return Workload(
             name=d["name"],
             input_tokens=_config_int(d["input_tokens"], "workload.input_tokens"),
@@ -121,88 +345,123 @@ class Config:
     inter_trial_pause_s: float
     max_run_duration_s: float
     shutdown_grace_s: float
+    unset_env_vars: tuple[str, ...] = ()
 
     @staticmethod
-    def load(path: Path) -> "Config":
-        raw = json.loads(path.read_text())
-        if not isinstance(raw, dict):
-            raise ValueError("config root must be an object")
-        deployments = raw["deployments"]
-        if not isinstance(deployments, dict) or not deployments:
-            raise ValueError("config.deployments must be a nonempty object")
-        if any(not isinstance(name, str) for name in deployments.values()):
-            raise ValueError("config deployment names must be strings")
-        workloads = _config_list(raw["workloads"], "workloads")
-        concurrency_levels = _config_list(
-            raw.get("concurrency_levels", [1, 2, 4, 8, 16, 32]),
-            "concurrency_levels",
-        )
-        offered_load_rpm = _config_list(
-            raw.get("offered_load_rpm", []), "offered_load_rpm"
-        )
-        streaming_load_rpm = _config_list(
-            raw.get("streaming_load_rpm", []), "streaming_load_rpm"
-        )
-        timeouts = raw.get("timeouts", {})
-        if not isinstance(timeouts, dict):
-            raise ValueError("timeouts must be an object")
-        generation = raw.get("generation", {})
-        if not isinstance(generation, dict):
-            raise ValueError("generation must be an object")
-        extra_params = generation.get("extra_params", {})
+    def from_env(env: Mapping[str, str] | None = None) -> "Config":
+        env = os.environ if env is None else env
+        unset: list[str] = []
+
+        def required(name: str) -> str:
+            value = _env_text(env, name)
+            if value is not None:
+                return value
+            unset.append(name)
+            return f"<unset {name}>"
+
+        endpoint = required("AZURE_OPENAI_ENDPOINT").rstrip("/")
+
+        deployments: dict[str, str] = {}
+        for key in sorted(env):
+            if not key.startswith(DEPLOYMENT_ENV_PREFIX):
+                continue
+            value = _env_text(env, key)
+            if value is not None:
+                deployments[_env_label(key[len(DEPLOYMENT_ENV_PREFIX) :])] = value
+        if not deployments:
+            for label in DEFAULT_DEPLOYMENT_LABELS:
+                deployments[label] = required(
+                    f"{DEPLOYMENT_ENV_PREFIX}{_label_suffix(label)}"
+                )
+
+        experiment: dict[str, Any] = {
+            "subscription_id": required("AZURE_SUBSCRIPTION_ID"),
+            "tenant_id": required("AZURE_TENANT_ID"),
+            "resource_group": required("AZURE_RESOURCE_GROUP"),
+            "foundry_resource": required("AZURE_FOUNDRY_RESOURCE"),
+            "foundry_project": required("AZURE_FOUNDRY_PROJECT"),
+            "model_name": required("BENCH_MODEL_NAME"),
+            "model_version": required("BENCH_MODEL_VERSION"),
+            "model_format": required("BENCH_MODEL_FORMAT"),
+            "region": required("BENCH_REGION"),
+            "client_location": required("BENCH_CLIENT_LOCATION"),
+            "content_filter_policy": required("BENCH_CONTENT_FILTER_POLICY"),
+            "version_upgrade_policy": required("BENCH_VERSION_UPGRADE_POLICY"),
+            "routing_scope": required("BENCH_ROUTING_SCOPE"),
+        }
+
+        # Absent keys, rather than "<unset ...>" markers, keep readiness from
+        # reporting the same field twice for numeric and SKU metadata.
+        target_rpm = _env_text(env, "BENCH_TARGET_RPM")
+        if target_rpm is None:
+            unset.append("BENCH_TARGET_RPM")
+        else:
+            experiment["target_rpm"] = _parse_scalar_number(
+                target_rpm, "BENCH_TARGET_RPM"
+            )
+
+        skus: dict[str, dict[str, Any]] = {}
+        for label in deployments:
+            prefix = f"{SKU_ENV_PREFIX}{_label_suffix(label)}"
+            sku: dict[str, Any] = {}
+            sku_name = _env_text(env, f"{prefix}_NAME")
+            if sku_name is None:
+                unset.append(f"{prefix}_NAME")
+            else:
+                sku["name"] = sku_name
+            capacity = _env_text(env, f"{prefix}_CAPACITY")
+            if capacity is None:
+                unset.append(f"{prefix}_CAPACITY")
+            else:
+                sku["capacity"] = _parse_scalar_number(
+                    capacity, f"{prefix}_CAPACITY"
+                )
+            skus[label] = sku
+        experiment["deployment_skus"] = skus
+
+        raw_workloads = _env_json(env, "BENCH_WORKLOADS", None)
+        if raw_workloads is None:
+            unset.append("BENCH_WORKLOADS")
+            raw_workloads = []
+        workloads = _config_list(raw_workloads, "BENCH_WORKLOADS")
+
+        extra_params = _env_json(env, "BENCH_GENERATION_EXTRA_PARAMS", {})
         if not isinstance(extra_params, dict):
-            raise ValueError("generation.extra_params must be an object")
-        experiment = raw.get("experiment", {})
-        if not isinstance(experiment, dict):
-            raise ValueError("experiment must be an object")
+            raise ValueError("BENCH_GENERATION_EXTRA_PARAMS must be a JSON object")
+
         return Config(
-            endpoint=raw["endpoint"].rstrip("/"),
-            api_version=raw["api_version"],
-            api_version_verified=raw.get("api_version_verified", False),
-            deployments=dict(deployments),
-            experiment=dict(experiment),
+            endpoint=endpoint,
+            api_version=_env_text(env, "AZURE_OPENAI_API_VERSION") or "v1",
+            api_version_verified=_env_bool(
+                env, "AZURE_OPENAI_API_VERSION_VERIFIED", False
+            ),
+            deployments=deployments,
+            experiment=experiment,
             workloads=tuple(Workload.from_dict(w) for w in workloads),
-            seed=_config_int(raw.get("seed", 0), "seed"),
-            trials=_config_int(raw.get("trials", 3), "trials"),
-            trial_duration_s=_config_number(
-                raw.get("trial_duration_s", 60), "trial_duration_s"
-            ),
-            warmup_requests=_config_int(
-                raw.get("warmup_requests", 5), "warmup_requests"
-            ),
+            seed=_env_int(env, "BENCH_SEED", 0),
+            trials=_env_int(env, "BENCH_TRIALS", 3),
+            trial_duration_s=_env_number(env, "BENCH_TRIAL_DURATION_S", 60),
+            warmup_requests=_env_int(env, "BENCH_WARMUP_REQUESTS", 5),
             concurrency_levels=tuple(
-                _config_int(value, f"concurrency_levels[{index}]")
-                for index, value in enumerate(concurrency_levels)
+                _env_ints(
+                    env, "BENCH_CONCURRENCY_LEVELS", (1, 2, 4, 8, 16, 32)
+                )
             ),
-            offered_load_rpm=tuple(
-                _config_number(value, f"offered_load_rpm[{index}]")
-                for index, value in enumerate(offered_load_rpm)
-            ),
+            offered_load_rpm=tuple(_env_numbers(env, "BENCH_OFFERED_LOAD_RPM", ())),
             streaming_load_rpm=tuple(
-                _config_number(value, f"streaming_load_rpm[{index}]")
-                for index, value in enumerate(streaming_load_rpm)
+                _env_numbers(env, "BENCH_STREAMING_LOAD_RPM", ())
             ),
-            connect_timeout_s=_config_number(
-                timeouts.get("connect_s", 10), "timeouts.connect_s"
-            ),
-            read_timeout_s=_config_number(
-                timeouts.get("read_s", 180), "timeouts.read_s"
-            ),
-            max_in_flight=_config_int(
-                raw.get("max_in_flight", 512), "max_in_flight"
-            ),
-            token_param=generation.get("token_param", "max_completion_tokens"),
-            extra_generation_params=dict(extra_params),
-            output_dir=Path(raw.get("output_dir", "results")),
-            inter_trial_pause_s=_config_number(
-                raw.get("inter_trial_pause_s", 3.0), "inter_trial_pause_s"
-            ),
-            max_run_duration_s=_config_number(
-                raw.get("max_run_duration_s", 8700), "max_run_duration_s"
-            ),
-            shutdown_grace_s=_config_number(
-                raw.get("shutdown_grace_s", 10), "shutdown_grace_s"
-            ),
+            connect_timeout_s=_env_number(env, "BENCH_CONNECT_TIMEOUT_S", 10),
+            read_timeout_s=_env_number(env, "BENCH_READ_TIMEOUT_S", 180),
+            max_in_flight=_env_int(env, "BENCH_MAX_IN_FLIGHT", 512),
+            token_param=_env_text(env, "BENCH_TOKEN_PARAM")
+            or "max_completion_tokens",
+            extra_generation_params=extra_params,
+            output_dir=Path(_env_text(env, "BENCH_OUTPUT_DIR") or "results"),
+            inter_trial_pause_s=_env_number(env, "BENCH_INTER_TRIAL_PAUSE_S", 3.0),
+            max_run_duration_s=_env_number(env, "BENCH_MAX_RUN_DURATION_S", 8700),
+            shutdown_grace_s=_env_number(env, "BENCH_SHUTDOWN_GRACE_S", 10),
+            unset_env_vars=tuple(unset),
         )
 
 
@@ -325,7 +584,7 @@ class PromptFactory:
 
         try:
             self._enc = tiktoken.get_encoding(model_hint)
-        except Exception:
+        except ValueError:
             self._enc = tiktoken.get_encoding("cl100k_base")
         self._system_tokens = len(self._enc.encode(SYSTEM_MESSAGE))
         self._cache: dict[int, str] = {}
@@ -498,7 +757,7 @@ class Executor:
         except Exception as exc:  # noqa: BLE001 - benchmark records every failure mode
             status, http_status, throttled = _classify(exc)
             error_type = type(exc).__name__
-            error_message = str(exc)[:400]
+            error_message = _safe_error_message(exc)
 
         total_latency = time.perf_counter() - t0
         return RequestResult(
@@ -907,14 +1166,28 @@ def aggregate(
                 else None
             ),
         },
-        "queue_delay_s": {"p50": percentile(queue, 50), "p95": percentile(queue, 95), "max": max(queue) if queue else None},
+        "queue_delay_s": {
+            "p50": percentile(queue, 50),
+            "p95": percentile(queue, 95),
+            "max": max(queue) if queue else None,
+        },
         "tokens": {
             "prompt": prompt_tokens,
             "completion": completion_tokens,
             "total": prompt_tokens + completion_tokens,
-            "prompt_per_s": round(prompt_tokens / elapsed_s, 2) if elapsed_s else None,
-            "completion_per_s": round(completion_tokens / elapsed_s, 2) if elapsed_s else None,
-            "total_per_s": round((prompt_tokens + completion_tokens) / elapsed_s, 2) if elapsed_s else None,
+            "prompt_per_s": (
+                round(prompt_tokens / elapsed_s, 2) if elapsed_s else None
+            ),
+            "completion_per_s": (
+                round(completion_tokens / elapsed_s, 2)
+                if elapsed_s
+                else None
+            ),
+            "total_per_s": (
+                round((prompt_tokens + completion_tokens) / elapsed_s, 2)
+                if elapsed_s
+                else None
+            ),
         },
         "rates": {
             "throttled_429": error_rate(sum(1 for r in rows if r.throttled)),
@@ -996,6 +1269,16 @@ def write_json_atomic(path: Path, value: Any) -> None:
 
 
 def build_client(cfg: Config):
+    if (
+        not isinstance(cfg.endpoint, str)
+        or not cfg.endpoint.strip()
+        or cfg.endpoint.lstrip().startswith("<")
+    ):
+        raise ValueError("endpoint is unresolved")
+    endpoint_error = _endpoint_validation_error(cfg.endpoint)
+    if endpoint_error is not None:
+        raise ValueError(endpoint_error)
+
     from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
     from openai import AsyncOpenAI
     import httpx
@@ -1028,7 +1311,14 @@ def build_client(cfg: Config):
     return client, credential, http_client
 
 
-async def warm_up(executor: Executor, cfg: Config, scenario: Scenario, label: str, name: str, run_id: str) -> None:
+async def warm_up(
+    executor: Executor,
+    cfg: Config,
+    scenario: Scenario,
+    label: str,
+    name: str,
+    run_id: str,
+) -> None:
     """Excluded from results: primes connections, DNS, TLS, and the deployment."""
     for i in range(cfg.warmup_requests):
         result = await executor.run(
@@ -1121,7 +1411,15 @@ async def execute(cfg: Config, labels: list[str], run_id: str, out_dir: Path) ->
                                 stats=stats,
                             )
                         else:
-                            scenario_hash = int(hashlib.sha256(scenario.scenario_id.encode()).hexdigest(), 16) % 1000
+                            scenario_hash = (
+                                int(
+                                    hashlib.sha256(
+                                        scenario.scenario_id.encode()
+                                    ).hexdigest(),
+                                    16,
+                                )
+                                % 1000
+                            )
                             await run_open_loop(
                                 executor,
                                 scenario,
@@ -1149,21 +1447,27 @@ async def execute(cfg: Config, labels: list[str], run_id: str, out_dir: Path) ->
                         active = None
                         await asyncio.sleep(cfg.inter_trial_pause_s)
     finally:
-        if active is not None:
-            agg.append(
-                summarize_trial(
-                    active,
-                    time.time(),
-                    time.perf_counter(),
-                    partial=True,
+        try:
+            if active is not None:
+                agg.append(
+                    summarize_trial(
+                        active,
+                        time.time(),
+                        time.perf_counter(),
+                        partial=True,
+                    )
                 )
-            )
-        write_json_atomic(aggregates_path, agg)
-        print(f"\nwrote {raw_path}")
-        print(f"wrote {aggregates_path}")
-        await client.close()
-        await http_client.aclose()
-        await credential.close()
+            write_json_atomic(aggregates_path, agg)
+            print(f"\nwrote {raw_path}")
+            print(f"wrote {aggregates_path}")
+        finally:
+            try:
+                await client.close()
+            finally:
+                try:
+                    await http_client.aclose()
+                finally:
+                    await credential.close()
 
 
 async def execute_with_deadline(
@@ -1193,7 +1497,8 @@ def _write_stop_record(out_dir: Path, reason: str, *, forced: bool) -> None:
                 "forced": forced,
             },
             indent=2,
-        )
+        ),
+        encoding="utf-8",
     )
 
 
@@ -1275,14 +1580,21 @@ def source_revision(repo_dir: Path) -> dict[str, Any]:
 
 def write_dependency_snapshot(out_dir: Path) -> dict[str, str]:
     completed = subprocess.run(
-        [sys.executable, "-m", "pip", "freeze"],
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "list",
+            "--format=freeze",
+            "--disable-pip-version-check",
+        ],
         check=True,
         capture_output=True,
         text=True,
     )
     content = completed.stdout.rstrip() + "\n"
-    path = out_dir / "pip-freeze.txt"
-    path.write_text(content)
+    path = out_dir / "pip-packages.txt"
+    path.write_text(content, encoding="utf-8")
     return {
         "file": path.name,
         "sha256": hashlib.sha256(content.encode()).hexdigest(),
@@ -1294,24 +1606,13 @@ def write_manifest(
     labels: list[str],
     run_id: str,
     out_dir: Path,
-    config_path: Path,
+    config_source: str,
     dependency_snapshot: dict[str, str],
 ) -> None:
-    """Immutable record of everything the experiment holds constant."""
+    """Record everything the experiment holds constant."""
     runner_path = Path(__file__).resolve()
-    resolved_config_path = config_path.resolve()
-    manifest = {
-        "run_id": run_id,
-        "runner_version": RUNNER_VERSION,
-        "runner_sha256": hashlib.sha256(runner_path.read_bytes()).hexdigest(),
-        "config_sha256": hashlib.sha256(
-            resolved_config_path.read_bytes()
-        ).hexdigest(),
-        "source": source_revision(runner_path.parent),
-        "started_utc": datetime.now(timezone.utc).isoformat(),
-        "experiment": cfg.experiment,
-        "config_file": str(config_path),
-        "config": {
+    effective_config = _redact_sensitive_values(
+        {
             "endpoint": cfg.endpoint,
             "api_version": cfg.api_version,
             "api_version_verified": cfg.api_version_verified,
@@ -1328,18 +1629,45 @@ def write_manifest(
             "streaming_load_rpm": list(cfg.streaming_load_rpm),
             "token_param": cfg.token_param,
             "extra_generation_params": cfg.extra_generation_params,
-            "timeouts": {"connect_s": cfg.connect_timeout_s, "read_s": cfg.read_timeout_s},
+            "timeouts": {
+                "connect_s": cfg.connect_timeout_s,
+                "read_s": cfg.read_timeout_s,
+            },
             "max_in_flight": cfg.max_in_flight,
             "workloads": [
-                {"name": w.name, "input_tokens": w.input_tokens, "max_output_tokens": w.max_output_tokens}
-                for w in cfg.workloads
+                {
+                    "name": workload.name,
+                    "input_tokens": workload.input_tokens,
+                    "max_output_tokens": workload.max_output_tokens,
+                }
+                for workload in cfg.workloads
             ],
-        },
+        }
+    )
+    experiment = _redact_sensitive_values(cfg.experiment)
+    manifest = {
+        "run_id": run_id,
+        "runner_version": RUNNER_VERSION,
+        "runner_sha256": hashlib.sha256(runner_path.read_bytes()).hexdigest(),
+        # Digest of the values actually used, since configuration now comes from
+        # the environment rather than a file that could be hashed directly.
+        "config_sha256": hashlib.sha256(
+            json.dumps(
+                {"experiment": experiment, "config": effective_config},
+                sort_keys=True,
+                default=str,
+            ).encode()
+        ).hexdigest(),
+        "source": source_revision(runner_path.parent),
+        "started_utc": datetime.now(timezone.utc).isoformat(),
+        "experiment": experiment,
+        "config_source": config_source,
+        "config": effective_config,
         "system_message": SYSTEM_MESSAGE,
         "client": {
             "python": sys.version.split()[0],
             "platform": platform.platform(),
-            "executable": sys.executable,
+            "executable": Path(sys.executable).name,
         },
         "auth": "DefaultAzureCredential (Entra ID); no API keys used",
         "retry_policy": {
@@ -1348,16 +1676,16 @@ def write_manifest(
         },
         "dependency_snapshot": dependency_snapshot,
     }
-    try:
-        import openai
-        import azure.identity
+    import azure.identity
+    import openai
 
-        manifest["client"]["openai"] = openai.__version__
-        manifest["client"]["azure_identity"] = azure.identity.__version__
-    except Exception:  # pragma: no cover
-        pass
+    manifest["client"]["openai"] = openai.__version__
+    manifest["client"]["azure_identity"] = azure.identity.__version__
 
-    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (out_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2),
+        encoding="utf-8",
+    )
 
 
 def nominal_runtime_s(cfg: Config, labels: Sequence[str]) -> float:
@@ -1387,14 +1715,38 @@ def _unresolved_paths(value: Any, prefix: str) -> list[str]:
     return []
 
 
-def readiness_errors(cfg: Config, labels: Sequence[str]) -> list[str]:
+def readiness_errors(
+    cfg: Config,
+    labels: Sequence[str],
+    *,
+    require_reference_pair: bool = False,
+) -> list[str]:
     errors: list[str] = []
+    if require_reference_pair:
+        missing_labels = [
+            label
+            for label in DEFAULT_DEPLOYMENT_LABELS
+            if label not in cfg.deployments
+        ]
+        if missing_labels:
+            expected_variables = ", ".join(
+                f"{DEPLOYMENT_ENV_PREFIX}{_label_suffix(label)}"
+                for label in missing_labels
+            )
+            errors.append(
+                "full comparison is missing deployment label(s): "
+                f"{', '.join(missing_labels)}; set {expected_variables}"
+            )
     if (
         not isinstance(cfg.endpoint, str)
         or not cfg.endpoint.strip()
         or cfg.endpoint.lstrip().startswith("<")
     ):
         errors.append("endpoint is unresolved")
+    else:
+        endpoint_error = _endpoint_validation_error(cfg.endpoint)
+        if endpoint_error is not None:
+            errors.append(endpoint_error)
     if (
         not isinstance(cfg.api_version, str)
         or not cfg.api_version.strip()
@@ -1528,27 +1880,38 @@ def readiness_errors(cfg: Config, labels: Sequence[str]) -> list[str]:
                     "experiment.target_rpm"
                 )
 
-    controlled_request_keys = {
-        "model",
-        "messages",
-        "stream",
-        "stream_options",
-        cfg.token_param,
-    }
-    overridden_keys = controlled_request_keys.intersection(
-        cfg.extra_generation_params
-    )
-    if overridden_keys:
+    if cfg.token_param not in ALLOWED_TOKEN_PARAMS:
         errors.append(
-            "generation.extra_params cannot override runner-controlled keys: "
-            + ", ".join(sorted(overridden_keys))
+            "generation.token_param must be max_completion_tokens or max_tokens"
         )
-    if (
-        not isinstance(cfg.token_param, str)
-        or not cfg.token_param.strip()
-        or cfg.token_param in {"model", "messages", "stream", "stream_options"}
-    ):
-        errors.append("generation.token_param is invalid")
+
+    if not isinstance(cfg.extra_generation_params, dict):
+        errors.append("generation.extra_params must be an object")
+    else:
+        controlled_request_keys = {
+            "model",
+            "messages",
+            "stream",
+            "stream_options",
+            cfg.token_param,
+        }
+        overridden_keys = controlled_request_keys.intersection(
+            cfg.extra_generation_params
+        )
+        if overridden_keys:
+            errors.append(
+                "generation.extra_params cannot override runner-controlled keys: "
+                + ", ".join(sorted(overridden_keys))
+            )
+        sensitive_paths = _sensitive_key_paths(
+            cfg.extra_generation_params,
+            "generation.extra_params",
+        )
+        if sensitive_paths:
+            errors.append(
+                "generation.extra_params must not contain credential fields: "
+                + ", ".join(sensitive_paths)
+            )
 
     deployment_skus = cfg.experiment.get("deployment_skus")
     if not isinstance(deployment_skus, dict):
@@ -1608,16 +1971,31 @@ def print_matrix(cfg: Config, labels: list[str]) -> None:
     runs = len(scenarios) * cfg.trials * len(labels)
     est_s = nominal_runtime_s(cfg, labels)
 
-    print(f"deployments      : {', '.join(f'{k} -> {cfg.deployments[k]}' for k in labels)}")
+    deployment_summary = ", ".join(
+        f"{label} -> {cfg.deployments[label]}" for label in labels
+    )
+    print(f"deployments      : {deployment_summary}")
     print(f"workloads        : {', '.join(w.name for w in cfg.workloads)}")
     print(f"scenarios        : {len(scenarios)}")
     print(f"trials           : {cfg.trials}")
     print(f"total runs       : {runs}")
-    print(f"trial duration   : {cfg.trial_duration_s:g}s (+{cfg.inter_trial_pause_s:g}s pause)")
-    print(f"estimated wall   : {est_s / 60:.1f} min ({est_s / 3600:.2f} h), excluding warm-up")
-    print(f"wall-time limit  : {cfg.max_run_duration_s / 60:.1f} min, including warm-up and drain")
+    print(
+        f"trial duration   : {cfg.trial_duration_s:g}s "
+        f"(+{cfg.inter_trial_pause_s:g}s pause)"
+    )
+    print(
+        f"estimated wall   : {est_s / 60:.1f} min "
+        f"({est_s / 3600:.2f} h), excluding warm-up"
+    )
+    print(
+        f"wall-time limit  : {cfg.max_run_duration_s / 60:.1f} min, "
+        "including warm-up and drain"
+    )
     print(f"shutdown grace   : {cfg.shutdown_grace_s:g}s before the hard limit")
-    print(f"nominal slack    : {(cfg.max_run_duration_s - cfg.shutdown_grace_s - est_s) / 60:.1f} min")
+    nominal_slack_minutes = (
+        cfg.max_run_duration_s - cfg.shutdown_grace_s - est_s
+    ) / 60
+    print(f"nominal slack    : {nominal_slack_minutes:.1f} min")
     print(f"seed             : {cfg.seed}")
     print()
     print(f"{'scenario_id':<34} {'pass':<13} {'mode':<10} {'conc':>5} {'rpm':>7}")
@@ -1631,21 +2009,65 @@ def print_matrix(cfg: Config, labels: list[str]) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Global Standard vs. provisioned throughput benchmark")
-    ap.add_argument("--config", type=Path, default=Path("bench.config.json"))
-    ap.add_argument("--dry-run", action="store_true", help="print the matrix and exit; contacts nothing")
-    ap.add_argument("--only", action="append", default=None, help="restrict to a deployment label (repeatable)")
-    ap.add_argument("--output-dir", type=Path, default=None)
+    ap = argparse.ArgumentParser(
+        description="Global Standard vs. provisioned throughput benchmark"
+    )
+    config_source_group = ap.add_mutually_exclusive_group()
+    config_source_group.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help="dotenv file to load instead of .env",
+    )
+    config_source_group.add_argument(
+        "--no-env-file",
+        action="store_true",
+        help="use process environment variables without loading a dotenv file",
+    )
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the matrix and exit; contacts nothing",
+    )
+    ap.add_argument(
+        "--only",
+        action="append",
+        default=None,
+        help="restrict to a deployment label (repeatable)",
+    )
+    ap.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="write artifacts here instead of results/<run-id>",
+    )
     args = ap.parse_args()
 
-    if not args.config.exists():
-        print(f"config not found: {args.config}", file=sys.stderr)
+    from dotenv import load_dotenv
+
+    env_file = args.env_file or Path(".env")
+    if args.no_env_file:
+        config_source = "environment"
+    elif env_file.is_file():
+        try:
+            load_dotenv(env_file, override=False)
+        except (OSError, UnicodeError) as exc:
+            print(f"failed to load dotenv file {env_file}: {exc}", file=sys.stderr)
+            return 2
+        config_source = env_file.name
+    elif env_file.exists():
+        print(f"dotenv path is not a file: {env_file}", file=sys.stderr)
         return 2
+    elif args.env_file is not None:
+        print(f"dotenv file not found: {env_file}", file=sys.stderr)
+        return 2
+    else:
+        config_source = "environment"
 
     try:
-        cfg = Config.load(args.config)
+        cfg = Config.from_env()
     except (AttributeError, KeyError, TypeError, ValueError, OSError) as exc:
-        print(f"invalid config: {exc}", file=sys.stderr)
+        print(f"invalid configuration: {exc}", file=sys.stderr)
         return 2
     labels = list(args.only) if args.only else list(cfg.deployments)
     unknown = [l for l in labels if l not in cfg.deployments]
@@ -1656,32 +2078,49 @@ def main() -> int:
 
     print_matrix(cfg, labels)
 
-    errors = readiness_errors(cfg, labels)
+    errors = readiness_errors(
+        cfg,
+        labels,
+        require_reference_pair=args.only is None,
+    )
+
+    def report(headline: str) -> None:
+        print(f"\n{headline}", file=sys.stderr)
+        for error in errors:
+            print(f"  - {error}", file=sys.stderr)
+        if cfg.unset_env_vars:
+            print("\nunset environment variables:", file=sys.stderr)
+            for name in cfg.unset_env_vars:
+                print(f"  - {name}", file=sys.stderr)
+            print("see .env.example for the full list", file=sys.stderr)
 
     if args.dry_run:
         print("\ndry run: no network calls made, no resources touched")
         if errors:
-            print("\ndry-run readiness failed:", file=sys.stderr)
-            for error in errors:
-                print(f"  - {error}", file=sys.stderr)
+            report("dry-run readiness failed:")
             return 2
         return 0
 
     if errors:
-        print("\nrefusing to run:", file=sys.stderr)
-        for error in errors:
-            print(f"  - {error}", file=sys.stderr)
+        report("refusing to run:")
         return 2
 
     run_id = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
     out_dir = args.output_dir or (cfg.output_dir / run_id)
-    out_dir.mkdir(parents=True, exist_ok=True)
     try:
+        out_dir.mkdir(parents=True, exist_ok=True)
         dependency_snapshot = write_dependency_snapshot(out_dir)
+        write_manifest(
+            cfg,
+            labels,
+            run_id,
+            out_dir,
+            config_source,
+            dependency_snapshot,
+        )
     except (OSError, subprocess.SubprocessError) as exc:
-        print(f"failed to capture dependency snapshot: {exc}", file=sys.stderr)
+        print(f"failed to initialize benchmark output: {exc}", file=sys.stderr)
         return 2
-    write_manifest(cfg, labels, run_id, out_dir, args.config, dependency_snapshot)
     print(f"\nrun_id: {run_id}\noutput: {out_dir}\n")
 
     return run_with_process_watchdog(cfg, labels, run_id, out_dir)

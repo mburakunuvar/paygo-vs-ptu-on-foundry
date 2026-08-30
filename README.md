@@ -1,216 +1,252 @@
 # PayGo vs. PTU Benchmarks on Microsoft Foundry
 
-## PTU vs Pay-As-You-Go 
+This project compares a Global Standard (pay-as-you-go) deployment with a
+Provisioned Throughput (PTU) deployment on the same Microsoft Foundry resource.
+It measures latency, throughput, throttling, and reliability under equivalent
+load.
 
-This project benchmarks **Provisioned Throughput (PTU)** against **Global Standard (Pay-As-You-Go)** deployments on the same Microsoft Foundry resource to compare latency, throughput, throttling, and cost under identical load.
+> **Capacity under test:** The reference configuration compares a 45-PTU
+> GPT-5.6 Luna Global Provisioned deployment with a GPT-5.6 Luna Global Standard
+> deployment configured for 1,350,000 TPM. This nominal match uses
+> [Luna's documented rate of 30,000 input TPM per PTU](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/provisioned-throughput-sizing);
+> actual capacity consumption also depends on the input/output workload mix.
 
-### Key Differences
+## What it compares
 
-| | Global Standard (PayGo) | Provisioned Throughput (PTU) |
+| Category | Global Standard / PayGo | Provisioned Throughput |
 |---|---|---|
-| **Billing** | Per token consumed | Per hour (whether used or not) |
-| **Routing** | Global (cross-region) | Regional (dedicated capacity) |
-| **Best for** | Variable/bursty workloads | Predictable, high-throughput workloads |
-| **Latency** | Shared capacity, variable | Reserved capacity, consistent |
-| **Cost risk** | Scales with usage | Clock starts at deployment creation |
+| Billing | Input and output token usage | Provisioned capacity for the deployment lifetime |
+| Capacity | Shared, usage-based capacity | Reserved, pre-allocated capacity |
+| Best fit | Variable or bursty workloads | Predictable, sustained workloads |
+| Latency | Can vary with shared demand | Typically steadier within provisioned capacity |
+| Scaling | Subject to quota and service limits | Capacity must be sized in advance |
+| Throttling | Depends on quota, rate limits, and shared capacity | Depends on provisioned capacity and workload shape |
 
-### Implementation Plan
+Standard deployments do not provide a latency SLA. Provisioned deployments
+have model- and configuration-specific latency targets; these are separate from
+the Azure service availability SLA. See
+[Provisioned throughput for Foundry Models](https://learn.microsoft.com/en-us/azure/foundry/openai/concepts/provisioned-throughput).
 
-The benchmark follows a phased approach designed to minimize PTU cost exposure:
+## Requirements
 
-1. **Plan** — Define the experiment contract and record all variables
-2. **Discover** — Confirm model, SKUs, quota, and pricing via the Foundry skill
-3. **Build** — Develop the async benchmark runner (`app.py`) with dry-run validation
-4. **Baseline Deploy** — Create the Global Standard deployment (tokens-only cost)
-5. **Validate** — Prove the runner works end-to-end against PayGo
-6. **Provision** — Create the PTU deployment (**hourly billing starts**)
-7. **Measure** — Run the benchmark matrix (3 workloads × concurrency/load sweeps × 3 trials)
-8. **Release** — **Delete PTU immediately** after measurement to stop billing
-9. **Analyze** — Compare latency distributions, throughput curves, and cost
-10. **Clean up** — Remove remaining deployments
+- Python 3.11 or newer.
+- Access to the Microsoft Foundry resource under test.
+- `Cognitive Services OpenAI User` or equivalent data-plane permission.
+- Azure CLI, managed identity, workload identity, or another
+  `DefaultAzureCredential` source.
+- Network access to the Foundry endpoint.
+- Matching Global Standard and PTU deployments that use the same model and
+  model version.
 
-### Benchmark Design
+> **Cost warning:** A PTU deployment incurs hourly charges while it exists.
+> Starting or stopping this runner does not change that billing.
 
-- **Runner**: Async Python using `AsyncOpenAI` + Entra ID auth
-- **Workloads**: Short chat, RAG/summarization, long generation
-- **Load patterns**: Closed-loop concurrency sweeps + open-loop offered-load sweeps
-- **Metrics**: E2E latency (p50–p99), TTFT, tokens/sec, 429 rate, utilization
-- **Controls**: Same model/version, content filter, generation params, single-attempt policy
-- **Safety**: Hard wall-clock deadline, warm-up validation, config-driven deployment switching
+## Methodology
 
-### Project Files
+The default matrix uses three workloads:
 
-| File | Purpose |
+| Workload | Target input tokens | Maximum output tokens |
+|---|---:|---:|
+| Short chat | 200 | 100 |
+| RAG-style request | 1,000 | 300 |
+| Long generation | 500 | 1,000 |
+
+Input values are deterministic prompt-construction targets. Use the recorded
+prompt-token counts in the results as the authoritative API measurements.
+
+Each workload runs through:
+
+- Closed-loop concurrency tests.
+- Fixed offered-load tests at configured requests per minute.
+- Streaming tests for time to first token.
+- Three trials with alternating deployment order and deterministic scenario
+  shuffling.
+
+Every request is attempted once. SDK retries are disabled so throttling and
+other failures remain visible.
+
+The reference target of 480 RPM is calibrated to the RAG-style workload. With
+Luna's 6:1 output-to-input normalization ratio, each request represents up to
+2,800 normalized tokens, or approximately 1,344,000 normalized TPM at 480 RPM.
+Using the same request rates for all three workloads intentionally tests how
+different input/output shapes behave against the same deployments.
+
+| Category | Recorded metrics |
 |---|---|
-| `03-ptuVSpaygo.md` | Full runbook with all procedures and commands |
-| `bench.config.json` | Benchmark runner configuration |
-| `app.py` | Benchmark runner implementation |
-| `test_app.py` | Runner test suite |
-| `results/` | Raw output, aggregates, and manifests |
+| Latency | End-to-end p50, p90, p95, p99, and maximum |
+| Streaming | Time to first token, completion time, and output-token cadence |
+| Throughput | Successful requests per second, achieved RPM, and tokens per second |
+| Reliability | Successes, HTTP 429s, timeouts, HTTP errors, exceptions, and invalid responses |
+| Load pressure | Queue delay, peak in-flight requests, backlog, and unfinished requests |
+| Usage | Prompt, completion, and total tokens |
 
-### Quick Start
+Results with fewer than 100 successful samples include a warning because p95
+and p99 values may not be statistically reliable.
+
+## Setup
+
+macOS, Linux, or a GitHub Codespace:
 
 ```bash
 python3 -m venv .venv
-./.venv/bin/python -m pip install -r requirements.txt
-./.venv/bin/python app.py --dry-run          # validate config
-./.venv/bin/python app.py --side standard    # run against PayGo
-./.venv/bin/python app.py --side provisioned # run against PTU
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+cp .env.example .env
 ```
 
-See [`03-ptuVSpaygo.md`](03-ptuVSpaygo.md) for the complete runbook.
+Windows PowerShell:
 
----
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+```
 
-## Test Results (2026-07-28)
+Edit `.env` and provide the resource-specific values:
 
-**Model**: `gpt-5.6-sol` v2026-07-09 · **Region**: swedencentral · **Endpoint**: `ptu-benchmarks-resource.openai.azure.com`
+| Variable | Purpose |
+|---|---|
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI resource root, such as `https://your-resource.openai.azure.com/` |
+| `AZURE_SUBSCRIPTION_ID`, `AZURE_TENANT_ID` | Resource provenance recorded in the run manifest |
+| `AZURE_RESOURCE_GROUP`, `AZURE_FOUNDRY_RESOURCE`, `AZURE_FOUNDRY_PROJECT` | Resource identity |
+| `AZURE_DEPLOYMENT_GLOBAL_STANDARD`, `AZURE_DEPLOYMENT_PROVISIONED` | Deployment names |
+| `BENCH_SKU_<LABEL>_NAME`, `BENCH_SKU_<LABEL>_CAPACITY` | Actual SKU names and capacities recorded as metadata |
+| `BENCH_MODEL_NAME`, `BENCH_MODEL_VERSION`, `BENCH_REGION` | Deployed model and region |
+| `BENCH_CLIENT_LOCATION` | Runner location, needed to interpret client latency |
 
-Two benchmark runs completed against the same Foundry resource. Results below are averaged across runs.
+Keep `AZURE_OPENAI_API_VERSION_VERIFIED=false` until the v1 endpoint has been
+confirmed for the resource, then set it to `true`. The runner accepts only
+HTTPS resource-root endpoints on the public Azure OpenAI domain.
 
-| | Global Standard (30 capacity) | Provisioned (45 PTU, GlobalProvisionedManaged) |
-|---|---|---|
-| **Run IDs** | `20260728T175439Z` / `20260728T195619Z` | same |
-| **Trials completed** | 24 scenarios × 2 runs | 35–39 scenarios × 2 runs (more trials completed) |
-| **Auth** | Entra ID (`DefaultAzureCredential`) | same |
-| **Retries** | Disabled (single attempt) | same |
+Deployment variables are discovered by prefix. For example,
+`AZURE_DEPLOYMENT_GLOBAL_STANDARD` creates the `global-standard` label used by
+`--only global-standard`. Each additional deployment also needs matching
+`BENCH_SKU_<LABEL>_NAME` and `BENCH_SKU_<LABEL>_CAPACITY` values.
 
-### Unloaded Latency (Concurrency = 1)
+For Global Standard, capacity is expressed in thousands of TPM, so `1350`
+means 1,350,000 TPM. For Global Provisioned, capacity is expressed in PTUs, so
+`45` means 45 PTUs. These values document the deployments; the runner does not
+create, resize, or verify Azure capacity.
 
-| Workload | Metric | Global Standard | Provisioned | Δ |
-|---|---|---|---|---|
-| **short-chat** | p50 latency | 1.918 s | 1.492 s | **−22%** |
-| | throughput | 156 tok/s | 204 tok/s | +31% |
-| **rag** | p50 latency | 4.437 s | 3.343 s | **−25%** |
-| | throughput | 283 tok/s | 377 tok/s | +33% |
-| **long-gen** | p50 latency | 12.988 s | 9.789 s | **−25%** |
-| | throughput | 104 tok/s | 142 tok/s | +37% |
+The `BENCH_*` values define the experiment. Comma-separated variables define
+load levels; `BENCH_WORKLOADS` and `BENCH_GENERATION_EXTRA_PARAMS` contain JSON.
+Real environment variables override values from `.env`. Use `--env-file` to
+load a different dotenv file, or `--no-env-file` to use only the process
+environment. An explicitly named dotenv file must exist.
 
-### Time to First Token (Streaming, 9 RPM)
+Authenticate before a live run:
 
-| Workload | Global Standard | Provisioned | Δ |
-|---|---|---|---|
-| **short-chat** | 0.838 s | 0.741 s | **−12%** |
-| **rag** | 0.847 s | 0.769 s | **−9%** |
-| **long-gen** | 0.830 s | 0.749 s | **−10%** |
+```bash
+az login
+az account show
+```
 
-### Offered Load at Target (18 RPM)
+## Run
 
-| Workload | Metric | Global Standard | Provisioned |
-|---|---|---|---|
-| **short-chat** | p50 latency | 2.090 s | 1.617 s |
-| | success rate | 37/38 (97%) | 38/38 (100%) |
-| | 429 rate | 0.0% | 0.0% |
-| **rag** | p50 latency | 4.755 s | 3.404 s |
-| | success rate | 28/28 (100%) | 45/45 (100%) |
-| | 429 rate | 0.0% | 0.0% |
-| **long-gen** | p50 latency | 13.913 s | 10.220 s |
-| | success rate | 36/36 (100%) | 55/66 (83%) |
-| | 429 rate | 0.0% | **18.3%** |
+Validate the complete configuration without network or Azure operations:
 
-### Offered Load at Saturation (27 RPM)
+```bash
+python app.py --dry-run
+```
 
-| Workload | Metric | Global Standard | Provisioned |
-|---|---|---|---|
-| **short-chat** | p50 latency | 2.041 s | 1.510 s |
-| | 429 rate | 0.0% | 1.0% |
-| **rag** | p50 latency | 4.698 s | 3.418 s |
-| | 429 rate | 0.0% | 0.0% |
-| **long-gen** | p50 latency | 13.268 s | 10.169 s |
-| | 429 rate | 0.0% | **30.0%** |
+This validates local configuration and runtime estimates only. It does not test
+authentication, network access, or whether the named deployments exist.
 
-### Key Observations
+The following optional troubleshooting commands send model requests. Global
+Standard requests incur token usage, and the PTU deployment continues incurring
+hourly charges while it exists.
 
-1. **PTU delivers 22–25% lower latency** across all workloads at low concurrency
-2. **TTFT is 9–12% faster** on provisioned throughput
-3. **Throughput is 31–37% higher** on PTU at concurrency = 1
-4. **Global Standard handles burst better** — zero 429s even at 27 RPM, while PTU shows throttling on `long-gen` at 18+ RPM (capacity-bound at 45 PTU)
-5. **PTU saturates on long-generation workloads** — the 45-PTU allocation is undersized for sustained 18+ RPM of 1000-token outputs
-6. Both runs show consistent patterns, confirming result reproducibility
+Each command runs the complete matrix against one deployment and has a nominal
+duration of about 63.6 minutes. They are not required before the combined run.
 
-> **Note**: These are interim results from trial 0–1 of a planned 3-trial matrix. Full analysis pending completion of all trials. Pricing comparison deferred to section 11 of the runbook.
+```bash
+python app.py --only global-standard
+python app.py --only provisioned
+```
 
-Raw results: [`results/`](results/)
+Run the full comparison:
 
----
+```bash
+python app.py
+```
 
-## Comprehensive Comparison Report (Interim, 2026-07-28)
+The default full comparison contains 144 measured scenario executions and has
+a nominal duration of 127.2 minutes, plus warm-up and request drain. Its hard
+wall-clock limit is 145 minutes. Review the current estimate from `--dry-run`
+before starting.
 
-This section consolidates the completed validation and benchmark evidence currently
-available in the repository. It is the most complete PayGo vs PTU comparison we can
-make right now, but it is still an interim report because the full 3-trial matrix has
-not finished yet.
+The runner warms both deployments before measurement, alternates deployment
+order between trials, checkpoints aggregates after every measured scenario,
+and enforces a hard wall-clock limit.
 
-### Evidence Base
+## Output
 
-- Unit test suite: 30 tests passed, covering request construction, queue timing,
-	cadence aggregation, warm-up ordering, deadline handling, and error classification.
-- Benchmark artifacts: the latest run produced manifests, dependency snapshots, raw
-	rows, and aggregates under `results/20260728T195619Z-4020a8f2/`.
-- Coverage status: 121 of 144 planned aggregate scenarios are present in the latest
-	artifact run, with trial 2 still incomplete.
-- Comparison scope: Global Standard (PayGo) and Provisioned Throughput (PTU) were
-	exercised against the same model, version, region, content filter, and generation
-	policy.
+Each live run creates a unique directory under `results/` unless
+`--output-dir` is provided:
 
-### Bottom Line
+| File | Contents |
+|---|---|
+| `manifest.json` | Effective experiment settings, source revision, and client metadata |
+| `pip-packages.txt` | Installed package names and versions |
+| `requests.jsonl` | One sanitized record per completed request |
+| `aggregates.json` | Per-scenario metrics and partial checkpoints |
+| `stopped.json` | Stop reason when a deadline or interruption ends a run |
 
-PTU is consistently faster on latency and TTFT in the completed samples, while
-Global Standard is more forgiving under bursty or saturated load and avoids hourly
-idle cost. The strongest completed evidence says PTU is the better choice for
-predictable, sustained traffic when low latency matters more than hourly billing,
-but PayGo is the safer default for bursty workloads and for any case where you do
-not want a deployment clock running.
+The runner does not collect Azure Monitor metrics. Export those separately
+using the UTC start and end times in the aggregates.
 
-### Completed Comparison
+## Interpret the results
 
-| Dimension | Global Standard (PayGo) | Provisioned Throughput (PTU) | Read on the completed tests |
-|---|---|---|---|
-| Unloaded latency | Higher across all three workloads | Lower by about 22-25% | PTU wins on steady-state latency |
-| TTFT (streaming, 9 RPM) | 0.838 s / 0.847 s / 0.830 s | 0.741 s / 0.769 s / 0.749 s | PTU is about 9-12% faster |
-| Throughput at concurrency = 1 | 156 / 283 / 104 tok/s | 204 / 377 / 142 tok/s | PTU is about 31-37% higher |
-| Offered load at 18 RPM | Lower latency, no throttling | Lower latency, but long-gen shows throttling | PTU is faster, but capacity-sensitive |
-| Offered load at 27 RPM | 0% 429 across workloads | 0-1% 429 on short-chat/rag, 30% on long-gen | PayGo handles burst better |
+- Compare the same workload, load level, and trial across deployments.
+- Treat p95 and p99 values with fewer than 100 successful samples as
+  directional only.
+- Use queue delay and client backlog to distinguish runner-side saturation from
+  service latency.
+- Review HTTP 429 and timeout rates alongside throughput; lower latency from a
+  heavily throttled run is not a better result.
+- Correlate client results with Azure Monitor metrics over each trial's UTC
+  window before drawing capacity conclusions.
 
-Workloads are ordered as short-chat, rag, long-gen.
+## Security and sharing
 
-### What the Completed Tests Say
+- The runner uses Microsoft Entra ID through `DefaultAzureCredential`; it does
+  not accept or write Azure OpenAI API keys.
+- Do not store client secrets, access tokens, passwords, or API keys in dotenv
+  files. Prefer `az login`, managed identity, or workload identity. For
+  automation, inject secrets from a secret store into the process environment.
+- `.env` variants and `results/` are ignored by Git. Only the blank
+  `.env.example` template is tracked.
+- Hand off the project through Git when possible. If sharing an archive, exclude
+  `.env`, `.venv`, `results/`, and `__pycache__/`.
+- The endpoint allowlist prevents Entra bearer tokens from being sent to
+  arbitrary hosts. Recorded error messages and sensitive generation parameter
+  fields are redacted.
+- Prompts and model responses are not written to the result artifacts.
+- Result artifacts contain non-secret but potentially sensitive resource
+  metadata, including subscription and tenant IDs, deployment names, and the
+  endpoint. Review artifacts before sharing them.
+- The dependency snapshot records package names and versions, not installation
+  URLs that could contain repository credentials.
 
-1. PTU improves first-token and end-to-end latency when the system is not heavily
-	 saturated.
-2. PTU also improves token throughput in the unloaded case.
-3. Global Standard is materially better at absorbing burst, especially on the long-
-	 generation workload where PTU starts to throttle at target and saturation load.
-4. The current 45-PTU allocation is adequate for the lighter workloads, but it is
-	 undersized for sustained long-gen traffic at 18+ RPM.
-5. The benchmark runner itself is behaving correctly: Entra ID auth, request
-	 validation, streaming TTFT capture, and artifact emission are all working.
+## Tests
 
-### Cost Interpretation
+The tests build an isolated configuration and do not read `.env`:
 
-PTU costs $45/hour at 45 PTU for as long as the deployment exists, whether or not
-requests are sent. Global Standard bills by token consumption and stays cheap while
-idle. That means the performance delta favors PTU, but the cost delta favors PayGo
-unless the workload is steady enough to justify the hourly capacity charge or a
-reservation.
+```bash
+python -m unittest -v test_app.py
+```
 
-### Practical Conclusion
+## Cleanup
 
-- Choose PTU if you need lower and more stable latency for a predictable workload,
-	especially when the traffic shape is steady enough to justify reserved capacity.
-- Choose Global Standard if your load is bursty, variable, or cost-sensitive when
-	idle.
-- For long-gen workloads, the current 45-PTU sizing should be treated as a lower
-	bound rather than a final capacity recommendation.
+After the benchmark:
 
-### Limits of This Report
+1. Confirm that result and aggregate files were written.
+2. Export the corresponding Azure Monitor metrics.
+3. Record the PTU deployment lifetime for cost analysis.
+4. Delete the PTU deployment if it is no longer needed.
+5. Confirm in Microsoft Foundry that deletion completed.
 
-- The full planned 144-scenario matrix is not finished yet.
-- p95 and p99 values are still weak in many scenarios because sample counts remain
-	low in several completed passes.
-- This report should be treated as the best available comparison from the completed
-	tests, not the final benchmark conclusion.
-
-Detailed raw data and manifests remain in [results/](results/), and the runbook is
-still the source of truth for the full experiment design in
-[03-ptuVSpaygo.md](03-ptuVSpaygo.md).
+PTU billing continues until the deployment itself is deleted.
