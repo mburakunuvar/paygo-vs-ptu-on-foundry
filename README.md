@@ -5,9 +5,10 @@ Provisioned Throughput (PTU) deployment on the same Microsoft Foundry resource.
 It measures latency, throughput, throttling, and reliability under equivalent
 load.
 
-> **Capacity under test:** The reference configuration compares a 45-PTU
+> **Capacity under test:** The reference configuration compares a 35-PTU
 > GPT-5.6 Luna Global Provisioned deployment with a GPT-5.6 Luna Global Standard
-> deployment configured for 1,350,000 TPM. This nominal match uses
+> deployment configured for 1,000,000 TPM (about 95% of the PTU side's nominal
+> capacity). This nominal match uses
 > [Luna's documented rate of 30,000 input TPM per PTU](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/provisioned-throughput-sizing);
 > actual capacity consumption also depends on the input/output workload mix.
 
@@ -65,9 +66,9 @@ Each workload runs through:
 Every request is attempted once. SDK retries are disabled so throttling and
 other failures remain visible.
 
-The reference target of 480 RPM is calibrated to the RAG-style workload. With
+The reference target of 357 RPM is calibrated to the RAG-style workload. With
 Luna's 6:1 output-to-input normalization ratio, each request represents up to
-2,800 normalized tokens, or approximately 1,344,000 normalized TPM at 480 RPM.
+2,800 normalized tokens, or approximately 999,600 normalized TPM at 357 RPM.
 Using the same request rates for all three workloads intentionally tests how
 different input/output shapes behave against the same deployments.
 
@@ -95,15 +96,7 @@ python -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Windows PowerShell:
 
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-Copy-Item .env.example .env
-```
 
 Edit `.env` and provide the resource-specific values:
 
@@ -126,9 +119,9 @@ Deployment variables are discovered by prefix. For example,
 `--only global-standard`. Each additional deployment also needs matching
 `BENCH_SKU_<LABEL>_NAME` and `BENCH_SKU_<LABEL>_CAPACITY` values.
 
-For Global Standard, capacity is expressed in thousands of TPM, so `1350`
-means 1,350,000 TPM. For Global Provisioned, capacity is expressed in PTUs, so
-`45` means 45 PTUs. These values document the deployments; the runner does not
+For Global Standard, capacity is expressed in thousands of TPM, so `1000`
+means 1,000,000 TPM. For Global Provisioned, capacity is expressed in PTUs, so
+`35` means 35 PTUs. These values document the deployments; the runner does not
 create, resize, or verify Azure capacity.
 
 The `BENCH_*` values define the experiment. Comma-separated variables define
