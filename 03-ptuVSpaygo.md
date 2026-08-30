@@ -349,8 +349,8 @@ az cognitiveservices account show \
   -o tsv
 ```
 
-Update `bench.config.json` and `03-cli-variables.md` with the deployment name
-and endpoint before proceeding to runner validation.
+Update `bench.config.json` with the deployment name and endpoint before
+proceeding to runner validation.
 
 ### 7.2 Create provisioned throughput
 
@@ -389,8 +389,8 @@ az cognitiveservices account deployment show \
   -o table
 ```
 
-Update `bench.config.json` and `03-cli-variables.md` with the provisioned
-deployment name. The measurement clock is now running.
+Update `bench.config.json` with the provisioned deployment name. The measurement
+clock is now running.
 
 ### 7.3 Verify deployment parity
 

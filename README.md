@@ -1,4 +1,4 @@
-# foundry-skills
+# PayGo vs. PTU Benchmark on Microsoft Foundry
 
 ## PTU vs Pay-As-You-Go Benchmark
 
@@ -43,11 +43,9 @@ The benchmark follows a phased approach designed to minimize PTU cost exposure:
 | File | Purpose |
 |---|---|
 | `03-ptuVSpaygo.md` | Full runbook with all procedures and commands |
-| `03-cli-variables.md` | Shell variables for deployment commands |
 | `bench.config.json` | Benchmark runner configuration |
 | `app.py` | Benchmark runner implementation |
 | `test_app.py` | Runner test suite |
-| `monitor.sh` | Azure Monitor metrics collection |
 | `results/` | Raw output, aggregates, and manifests |
 
 ### Quick Start
