@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit
 
-RUNNER_VERSION = "1.3.0"
+RUNNER_VERSION = "1.4.0"
 
 SYSTEM_MESSAGE = (
     "You are a benchmarking assistant. Answer the user's request directly and "
@@ -83,6 +83,11 @@ SKU_ENV_PREFIX = "BENCH_SKU_"
 DEFAULT_DEPLOYMENT_LABELS = ("global-standard", "provisioned")
 AZURE_OPENAI_HOST_SUFFIX = ".openai.azure.com"
 ALLOWED_TOKEN_PARAMS = {"max_completion_tokens", "max_tokens"}
+PROMPT_CACHE_CONTROL_KEYS = {
+    "prompt_cache_key",
+    "prompt_cache_options",
+    "prompt_cache_retention",
+}
 SENSITIVE_KEY_MARKERS = {
     "accesstoken",
     "accountkey",
@@ -577,7 +582,7 @@ def deployment_order(labels: Sequence[str], trial: int) -> list[str]:
 
 
 class PromptFactory:
-    """Builds prompts of an exact token length, deterministically."""
+    """Builds token-targeted prompts with a unique per-request prefix."""
 
     def __init__(self, model_hint: str = "o200k_base") -> None:
         import tiktoken
@@ -587,20 +592,21 @@ class PromptFactory:
         except ValueError:
             self._enc = tiktoken.get_encoding("cl100k_base")
         self._system_tokens = len(self._enc.encode(SYSTEM_MESSAGE))
-        self._cache: dict[int, str] = {}
+        self._body_cache: dict[int, list[int]] = {}
 
-    def build(self, target_input_tokens: int) -> str:
-        """Return user text so that system + user is close to target_input_tokens."""
-        if target_input_tokens in self._cache:
-            return self._cache[target_input_tokens]
-
+    def build(self, target_input_tokens: int, variant: str) -> str:
+        """Return user text with an early cache-busting request marker."""
         budget = max(16, target_input_tokens - self._system_tokens)
-        filler_tokens = max(1, len(self._enc.encode(_FILLER)))
-        repeats = math.ceil(budget / filler_tokens) + 1
-        tokens = self._enc.encode(_PROMPT_PREFIX + _FILLER * repeats)[:budget]
-        text = self._enc.decode(tokens)
-        self._cache[target_input_tokens] = text
-        return text
+        body_tokens = self._body_cache.get(target_input_tokens)
+        if body_tokens is None:
+            filler_tokens = max(1, len(self._enc.encode(_FILLER)))
+            repeats = math.ceil(budget / filler_tokens) + 1
+            body_tokens = self._enc.encode(_PROMPT_PREFIX + _FILLER * repeats)
+            self._body_cache[target_input_tokens] = body_tokens
+
+        marker = hashlib.sha256(variant.encode()).hexdigest()
+        marker_tokens = self._enc.encode(f"Request marker {marker}. ")
+        return self._enc.decode((marker_tokens + body_tokens)[:budget])
 
 
 # --------------------------------------------------------------------------
@@ -678,13 +684,25 @@ class Executor:
         self._cfg = cfg
         self._prompts = prompts
 
-    def _kwargs(self, deployment: str, wl: Workload, stream: bool) -> dict[str, Any]:
+    def _kwargs(
+        self,
+        deployment: str,
+        wl: Workload,
+        stream: bool,
+        prompt_variant: str,
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             **self._cfg.extra_generation_params,
             "model": deployment,
             "messages": [
                 {"role": "system", "content": SYSTEM_MESSAGE},
-                {"role": "user", "content": self._prompts.build(wl.input_tokens)},
+                {
+                    "role": "user",
+                    "content": self._prompts.build(
+                        wl.input_tokens,
+                        prompt_variant,
+                    ),
+                },
             ],
             self._cfg.token_param: wl.max_output_tokens,
         }
@@ -708,7 +726,12 @@ class Executor:
     ) -> RequestResult:
         wl = scenario.workload
         stream = scenario.mode == "stream"
-        kwargs = self._kwargs(deployment_name, wl, stream)
+        kwargs = self._kwargs(
+            deployment_name,
+            wl,
+            stream,
+            f"{run_id}:{scenario.scenario_id}:{trial}:{seq}",
+        )
 
         start_epoch = time.time()
         t0 = time.perf_counter()
@@ -1634,6 +1657,9 @@ def write_manifest(
                 "read_s": cfg.read_timeout_s,
             },
             "max_in_flight": cfg.max_in_flight,
+            "prompt_cache_strategy": (
+                "unique request marker before repeated prompt content"
+            ),
             "workloads": [
                 {
                     "name": workload.name,
@@ -1894,7 +1920,7 @@ def readiness_errors(
             "stream",
             "stream_options",
             cfg.token_param,
-        }
+        } | PROMPT_CACHE_CONTROL_KEYS
         overridden_keys = controlled_request_keys.intersection(
             cfg.extra_generation_params
         )
@@ -2043,17 +2069,36 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    from dotenv import load_dotenv
+    from dotenv import dotenv_values
 
     env_file = args.env_file or Path(".env")
+    file_env: dict[str, str] = {}
+    using_env_file = False
     if args.no_env_file:
         config_source = "environment"
     elif env_file.is_file():
+        using_env_file = True
         try:
-            load_dotenv(env_file, override=False)
+            parsed_env = dotenv_values(env_file, interpolate=False)
         except (OSError, UnicodeError) as exc:
             print(f"failed to load dotenv file {env_file}: {exc}", file=sys.stderr)
             return 2
+        file_env = {
+            name: value
+            for name, value in parsed_env.items()
+            if value is not None
+        }
+        shadowed = sorted(
+            name
+            for name, value in file_env.items()
+            if value and name in os.environ and os.environ[name] != value
+        )
+        if shadowed:
+            print(
+                f"warning: process environment overrides {env_file.name}: "
+                + ", ".join(shadowed),
+                file=sys.stderr,
+            )
         config_source = env_file.name
     elif env_file.exists():
         print(f"dotenv path is not a file: {env_file}", file=sys.stderr)
@@ -2064,8 +2109,15 @@ def main() -> int:
     else:
         config_source = "environment"
 
+    if using_env_file:
+        effective_env = {
+            name: os.environ.get(name, value)
+            for name, value in file_env.items()
+        }
+    else:
+        effective_env = dict(os.environ)
     try:
-        cfg = Config.from_env()
+        cfg = Config.from_env(effective_env)
     except (AttributeError, KeyError, TypeError, ValueError, OSError) as exc:
         print(f"invalid configuration: {exc}", file=sys.stderr)
         return 2

@@ -11,11 +11,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from dotenv import dotenv_values
+
 from app import (
     BenchmarkDeadlineExceeded,
     Config,
     Executor,
     LoadStats,
+    PromptFactory,
     RequestResult,
     Scenario,
     WarmupError,
@@ -89,6 +92,19 @@ CANONICAL_ENV = {
     "BENCH_TOKEN_PARAM": "max_completion_tokens",
     "BENCH_GENERATION_EXTRA_PARAMS": json.dumps({"reasoning_effort": "none"}),
     "BENCH_OUTPUT_DIR": "results",
+}
+
+TERRA_ENV_OVERRIDES = {
+    "AZURE_DEPLOYMENT_GLOBAL_STANDARD": "terra-global-standard",
+    "AZURE_DEPLOYMENT_PROVISIONED": "terra-provisioned",
+    "BENCH_SKU_GLOBAL_STANDARD_CAPACITY": "100",
+    "BENCH_MODEL_NAME": "gpt-5.6-terra",
+    "BENCH_TARGET_RPM": "35.7",
+    "BENCH_OFFERED_LOAD_RPM": "18,35.7,53",
+    "BENCH_STREAMING_LOAD_RPM": "18,35.7",
+    "BENCH_TRIAL_DURATION_S": "180",
+    "BENCH_MAX_RUN_DURATION_S": "27600",
+    "BENCH_OUTPUT_DIR": "results/terra",
 }
 
 
@@ -182,17 +198,31 @@ class BenchmarkMetricTests(unittest.TestCase):
                 "temperature": 0.2,
             },
         )
-        prompts = SimpleNamespace(build=lambda tokens: "prompt")
+        prompts = SimpleNamespace(build=lambda tokens, variant: "prompt")
         executor = Executor(SimpleNamespace(), cfg, prompts)
 
         kwargs = executor._kwargs(
-            "expected-deployment", Workload("rag", 1000, 300), False
+            "expected-deployment",
+            Workload("rag", 1000, 300),
+            False,
+            "run:scenario:0:1",
         )
 
         self.assertEqual(kwargs["model"], "expected-deployment")
         self.assertEqual(kwargs["max_completion_tokens"], 300)
         self.assertEqual(kwargs["messages"][0]["role"], "system")
         self.assertEqual(kwargs["temperature"], 0.2)
+
+    def test_prompt_variants_avoid_cache_reuse_and_remain_repeatable(self):
+        prompts = PromptFactory()
+
+        first = prompts.build(1200, "run-a:scenario:0:1")
+        repeated = prompts.build(1200, "run-a:scenario:0:1")
+        next_request = prompts.build(1200, "run-a:scenario:0:2")
+
+        self.assertEqual(first, repeated)
+        self.assertNotEqual(first, next_request)
+        self.assertNotEqual(first[:256], next_request[:256])
 
     def test_open_loop_arrival_rate_excludes_request_drain(self):
         rows = [request_result(seq=index) for index in range(18)]
@@ -389,7 +419,7 @@ class BenchmarkAsyncTests(unittest.IsolatedAsyncioTestCase):
                 )
             ),
             cfg,
-            SimpleNamespace(build=lambda tokens: "prompt"),
+            SimpleNamespace(build=lambda tokens, variant: "prompt"),
         )
         scenario = Scenario(
             scenario_id="load-rag-r18",
@@ -448,7 +478,7 @@ class BenchmarkAsyncTests(unittest.IsolatedAsyncioTestCase):
                 )
             ),
             cfg,
-            SimpleNamespace(build=lambda tokens: "prompt"),
+            SimpleNamespace(build=lambda tokens, variant: "prompt"),
         )
         scenario = Scenario(
             scenario_id="conc-rag-c1",
@@ -1136,6 +1166,10 @@ class BenchmarkManifestTests(unittest.TestCase):
         self.assertEqual(manifest["retry_policy"]["attempts_per_request"], 1)
         self.assertEqual(manifest["config"]["max_run_duration_s"], 8700)
         self.assertEqual(manifest["config"]["max_in_flight"], 64)
+        self.assertEqual(
+            manifest["config"]["prompt_cache_strategy"],
+            "unique request marker before repeated prompt content",
+        )
         self.assertEqual(manifest["dependency_snapshot"]["sha256"], "digest")
         self.assertEqual(manifest["client"]["executable"], Path(sys.executable).name)
 
@@ -1205,6 +1239,91 @@ class BenchmarkManifestTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(len(build_scenarios(cfg)), 24)
         self.assertEqual(nominal_runtime_s(cfg, list(cfg.deployments)), 7632)
+
+    def test_terra_profile_parses_and_fits_its_runtime_budget(self):
+        cfg = canonical_config(**TERRA_ENV_OVERRIDES)
+
+        errors = readiness_errors(cfg, list(cfg.deployments))
+
+        self.assertEqual(errors, [])
+        self.assertEqual(cfg.experiment["model_name"], "gpt-5.6-terra")
+        self.assertEqual(cfg.experiment["target_rpm"], 35.7)
+        self.assertEqual(
+            cfg.experiment["deployment_skus"]["global-standard"]["capacity"],
+            100,
+        )
+        self.assertEqual(cfg.offered_load_rpm, (18.0, 35.7, 53.0))
+        self.assertEqual(nominal_runtime_s(cfg, list(cfg.deployments)), 26352)
+
+    def test_tracked_profile_templates_are_runnable_when_completed(self):
+        resource_fields = (
+            "AZURE_OPENAI_ENDPOINT",
+            "AZURE_OPENAI_API_VERSION_VERIFIED",
+            "AZURE_SUBSCRIPTION_ID",
+            "AZURE_TENANT_ID",
+            "AZURE_RESOURCE_GROUP",
+            "AZURE_FOUNDRY_RESOURCE",
+            "AZURE_FOUNDRY_PROJECT",
+            "AZURE_DEPLOYMENT_GLOBAL_STANDARD",
+            "AZURE_DEPLOYMENT_PROVISIONED",
+            "BENCH_REGION",
+            "BENCH_CLIENT_LOCATION",
+        )
+        resource_values = {
+            name: CANONICAL_ENV[name]
+            for name in resource_fields
+        }
+        profiles = (
+            (".env.luna.example", "gpt-5.6-luna", 357, Path("results/luna")),
+            (".env.terra.example", "gpt-5.6-terra", 35.7, Path("results/terra")),
+        )
+
+        for filename, model, target_rpm, output_dir in profiles:
+            with self.subTest(profile=filename):
+                parsed = dotenv_values(
+                    Path(__file__).with_name(filename),
+                    interpolate=False,
+                )
+                profile_env = {
+                    name: value
+                    for name, value in parsed.items()
+                    if value is not None
+                }
+                profile_env.update(resource_values)
+                cfg = Config.from_env(profile_env)
+
+                self.assertEqual(
+                    readiness_errors(
+                        cfg,
+                        list(cfg.deployments),
+                        require_reference_pair=True,
+                    ),
+                    [],
+                )
+                self.assertEqual(cfg.experiment["model_name"], model)
+                self.assertEqual(cfg.experiment["target_rpm"], target_rpm)
+                self.assertEqual(cfg.output_dir, output_dir)
+
+    def test_manifest_digest_distinguishes_luna_and_terra_profiles(self):
+        def digest(cfg):
+            with tempfile.TemporaryDirectory() as directory:
+                out_dir = Path(directory)
+                write_manifest(
+                    cfg,
+                    list(cfg.deployments),
+                    "run",
+                    out_dir,
+                    ".env",
+                    {"file": "pip-packages.txt", "sha256": "digest"},
+                )
+                return json.loads(
+                    (out_dir / "manifest.json").read_text(encoding="utf-8")
+                )["config_sha256"]
+
+        self.assertNotEqual(
+            digest(canonical_config()),
+            digest(canonical_config(**TERRA_ENV_OVERRIDES)),
+        )
 
     def test_readiness_requires_baseline_and_target_load_coverage(self):
         cfg = canonical_config()
@@ -1315,6 +1434,8 @@ class BenchmarkManifestTests(unittest.TestCase):
         env_file_body = "\n".join(
             f"{name}={value}" for name, value in canonical_env().items()
         )
+        captured_configs = []
+        errors = io.StringIO()
 
         with tempfile.TemporaryDirectory() as directory:
             env_path = Path(directory) / ".env"
@@ -1326,16 +1447,106 @@ class BenchmarkManifestTests(unittest.TestCase):
                     "argv",
                     ["app.py", "--env-file", str(env_path), "--dry-run"],
                 ),
+                patch(
+                    "app.print_matrix",
+                    side_effect=lambda cfg, labels: captured_configs.append(cfg),
+                ),
                 contextlib.redirect_stdout(io.StringIO()),
-                contextlib.redirect_stderr(io.StringIO()),
+                contextlib.redirect_stderr(errors),
             ):
                 exit_code = main()
-                cfg = Config.from_env()
 
+        cfg = captured_configs[0]
         self.assertEqual(exit_code, 0)
         self.assertEqual(cfg.max_in_flight, 7)
         self.assertEqual(cfg.seed, 20260727)
         self.assertEqual(cfg.deployments["provisioned"], "model-provisioned")
+        self.assertIn(
+            "process environment overrides .env: BENCH_MAX_IN_FLIGHT",
+            errors.getvalue(),
+        )
+
+    def test_dotenv_values_are_not_exported_to_the_process(self):
+        env_file_body = "\n".join(
+            f"{name}={value}" for name, value in canonical_env().items()
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env.luna"
+            env_path.write_text(env_file_body, encoding="utf-8")
+            with (
+                isolated_env({}),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["app.py", "--env-file", str(env_path), "--dry-run"],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                exit_code = main()
+                self.assertNotIn("AZURE_OPENAI_ENDPOINT", os.environ)
+                self.assertNotIn("BENCH_MODEL_NAME", os.environ)
+
+        self.assertEqual(exit_code, 0)
+
+    def test_env_file_ignores_undeclared_ambient_deployments(self):
+        env_file_body = "\n".join(
+            f"{name}={value}" for name, value in canonical_env().items()
+        )
+        captured_configs = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env.luna"
+            env_path.write_text(env_file_body, encoding="utf-8")
+            with (
+                isolated_env(
+                    {
+                        "AZURE_DEPLOYMENT_DATA_ZONE": "unrelated-deployment",
+                        "BENCH_SKU_DATA_ZONE_NAME": "DataZoneStandard",
+                        "BENCH_SKU_DATA_ZONE_CAPACITY": "20",
+                    }
+                ),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["app.py", "--env-file", str(env_path), "--dry-run"],
+                ),
+                patch(
+                    "app.print_matrix",
+                    side_effect=lambda cfg, labels: captured_configs.append(cfg),
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                exit_code = main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            sorted(captured_configs[0].deployments),
+            ["global-standard", "provisioned"],
+        )
+
+    def test_empty_explicit_env_file_does_not_fall_back_to_ambient_config(self):
+        errors = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env.empty"
+            env_path.write_text("", encoding="utf-8")
+            with (
+                isolated_env(canonical_env()),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["app.py", "--env-file", str(env_path), "--dry-run"],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(errors),
+            ):
+                exit_code = main()
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("endpoint is unresolved", errors.getvalue())
 
     def test_explicit_missing_dotenv_file_is_rejected(self):
         errors = io.StringIO()
@@ -1407,6 +1618,21 @@ class BenchmarkManifestTests(unittest.TestCase):
         self.assertIn("trials must be at least 3", errors)
         self.assertTrue(
             any("runner-controlled keys: model" in error for error in errors)
+        )
+
+    def test_readiness_rejects_prompt_cache_controls(self):
+        cfg = canonical_config(
+            BENCH_GENERATION_EXTRA_PARAMS=json.dumps(
+                {"prompt_cache_options": {"mode": "explicit"}}
+            )
+        )
+
+        errors = readiness_errors(cfg, ["global-standard"])
+
+        self.assertIn(
+            "generation.extra_params cannot override runner-controlled keys: "
+            "prompt_cache_options",
+            errors,
         )
 
     def test_process_watchdog_kills_worker_at_hard_limit(self):

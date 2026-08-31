@@ -26,16 +26,22 @@ trap 'die "Setup stopped near line $LINENO."' ERR
 
 usage() {
 	cat <<'EOF'
-Usage: ./get-foundry-resources.sh [--output PATH]
+Usage: ./get-foundry-resources.sh [--template PATH] [--output PATH]
 
 Interactively discovers an existing Microsoft Foundry resource, project, and
 matching Global Standard/PTU deployments, then generates a dotenv file. Azure
-resources are never created or changed.
+resources are never created or changed. Use a model-specific template to retain
+that profile's calibrated load matrix and runtime settings.
 EOF
 }
 
 while (($#)); do
 	case "$1" in
+		--template)
+			(($# >= 2)) || die "--template requires a path."
+			TEMPLATE_FILE="$2"
+			shift 2
+			;;
 		--output)
 			(($# >= 2)) || die "--output requires a path."
 			OUTPUT_FILE="$2"
@@ -52,7 +58,7 @@ while (($#)); do
 done
 
 [[ -t 0 ]] || die "Run this script in an interactive terminal."
-[[ -r "$TEMPLATE_FILE" ]] || die "Cannot read $TEMPLATE_FILE."
+[[ -r "$TEMPLATE_FILE" ]] || die "Cannot read template: $TEMPLATE_FILE"
 command -v az >/dev/null 2>&1 || die "Azure CLI is required. Install it, then run 'az login'."
 
 if command -v python3 >/dev/null 2>&1 \

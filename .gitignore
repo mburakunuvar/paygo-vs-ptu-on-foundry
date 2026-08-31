@@ -3,8 +3,10 @@ __pycache__/
 *.pyc
 results/
 
-# Local configuration; copy .env.example to create it.
+# Local configuration; copy a tracked profile template to create it.
 .env*
 *.env
 *.env.*
 !.env.example
+!.env.luna.example
+!.env.terra.example
