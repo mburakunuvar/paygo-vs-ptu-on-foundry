@@ -28,6 +28,7 @@ from app import (
     build_client,
     build_scenarios,
     build_warmup_scenario,
+    deployment_order,
     execute,
     execute_with_deadline,
     main,
@@ -80,7 +81,7 @@ CANONICAL_ENV = {
         ]
     ),
     "BENCH_SEED": "20260727",
-    "BENCH_TRIALS": "3",
+    "BENCH_TRIALS": "2",
     "BENCH_TRIAL_DURATION_S": "50",
     "BENCH_INTER_TRIAL_PAUSE_S": "3",
     "BENCH_MAX_RUN_DURATION_S": "8700",
@@ -102,8 +103,8 @@ TERRA_ENV_OVERRIDES = {
     "BENCH_TARGET_RPM": "35.7",
     "BENCH_OFFERED_LOAD_RPM": "18,35.7,53",
     "BENCH_STREAMING_LOAD_RPM": "18,35.7",
-    "BENCH_TRIAL_DURATION_S": "180",
-    "BENCH_MAX_RUN_DURATION_S": "27600",
+    "BENCH_TRIAL_DURATION_S": "100",
+    "BENCH_MAX_RUN_DURATION_S": "10800",
     "BENCH_OUTPUT_DIR": "results/terra",
 }
 
@@ -1238,7 +1239,14 @@ class BenchmarkManifestTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
         self.assertEqual(len(build_scenarios(cfg)), 24)
-        self.assertEqual(nominal_runtime_s(cfg, list(cfg.deployments)), 7632)
+        self.assertEqual(cfg.trials, 2)
+        self.assertEqual(nominal_runtime_s(cfg, list(cfg.deployments)), 5088)
+
+    def test_two_trials_balance_deployment_order(self):
+        labels = ["global-standard", "provisioned"]
+
+        self.assertEqual(deployment_order(labels, 0), labels)
+        self.assertEqual(deployment_order(labels, 1), list(reversed(labels)))
 
     def test_terra_profile_parses_and_fits_its_runtime_budget(self):
         cfg = canonical_config(**TERRA_ENV_OVERRIDES)
@@ -1253,7 +1261,9 @@ class BenchmarkManifestTests(unittest.TestCase):
             100,
         )
         self.assertEqual(cfg.offered_load_rpm, (18.0, 35.7, 53.0))
-        self.assertEqual(nominal_runtime_s(cfg, list(cfg.deployments)), 26352)
+        self.assertEqual(cfg.trials, 2)
+        self.assertEqual(cfg.max_run_duration_s, 10800)
+        self.assertEqual(nominal_runtime_s(cfg, list(cfg.deployments)), 9888)
 
     def test_tracked_profile_templates_are_runnable_when_completed(self):
         resource_fields = (
@@ -1605,7 +1615,7 @@ class BenchmarkManifestTests(unittest.TestCase):
             any("deployment_skus.provisioned is missing" in error for error in errors)
         )
 
-    def test_readiness_requires_three_trials_and_rejects_reserved_extras(self):
+    def test_readiness_requires_two_trials_and_rejects_reserved_extras(self):
         cfg = canonical_config()
         cfg = replace(
             cfg,
@@ -1615,7 +1625,7 @@ class BenchmarkManifestTests(unittest.TestCase):
 
         errors = readiness_errors(cfg, list(cfg.deployments))
 
-        self.assertIn("trials must be at least 3", errors)
+        self.assertIn("trials must be at least 2", errors)
         self.assertTrue(
             any("runner-controlled keys: model" in error for error in errors)
         )

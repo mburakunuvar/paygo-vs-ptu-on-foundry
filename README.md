@@ -78,7 +78,7 @@ Each workload runs through:
 - Closed-loop concurrency tests.
 - Fixed offered-load tests at configured requests per minute.
 - Streaming tests for time to first token.
-- Three trials with alternating deployment order and deterministic scenario
+- Two trials with alternating deployment order and deterministic scenario
   shuffling.
 
 Every request is attempted once. SDK retries are disabled so throttling and
@@ -99,11 +99,9 @@ workload therefore represents up to 2,800 normalized tokens per request:
 | Luna | 180 RPM | 357 RPM | 530 RPM | 999,600 |
 | Terra | 18 RPM | 35.7 RPM | 53 RPM | 99,960 |
 
-The Luna target is a nominal match for 1,000,000 TPM. The Terra target uses
-`100,000 / 2,800 = 35.7 RPM`, rounded to one decimal place, and remains below
-the PTU side's nominal 105,000 TPM. Using each profile's rates for all three
-workloads intentionally tests how different input/output shapes behave against
-the same pair of deployments.
+> Luna is tested near 1 million TPM, while Terra is tested near 100,000 TPM. We calculate the request rate using the largest workload, which consumes up to 2,800 normalized tokens per request. This gives 357 RPM for Luna and 35.7 RPM for Terra. Terra's rate is slightly below the 35-PTU deployment's nominal capacity of 105,000 TPM. We then reuse these request rates across all workload shapes to compare how different input and output sizes affect performance.
+
+> The benchmark tests normal-context requests covered by [Microsoft’s published latency targets](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/provisioned-throughput-sizing#latest-azure-openai-models). Long-context performance is not tested.
 
 | Category | Recorded metrics |
 |---|---|
@@ -119,10 +117,10 @@ and p99 values may not be statistically reliable.
 
 ## Setup
 
-macOS, Linux, or a GitHub Codespace:
+**note** for GitHub Codespaces :
 
 ```bash
-python3 -m venv .venv
+python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
@@ -130,16 +128,6 @@ cp .env.luna.example .env.luna
 cp .env.terra.example .env.terra
 ```
 
-Windows PowerShell:
-
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-Copy-Item .env.luna.example .env.luna
-Copy-Item .env.terra.example .env.terra
-```
 
 Create and edit the profile for each model you plan to test. Always pass its
 name with `--env-file`; running `python app.py` without that option looks for a
@@ -193,17 +181,6 @@ dotenv file must exist.
 `BENCH_GENERATION_EXTRA_PARAMS` cannot set model, message, streaming, token, or
 prompt-cache control fields because those are owned by the runner.
 
-To discover existing resources and generate each profile interactively, use
-the matching tracked template. Run the command twice and select the appropriate
-model pair each time:
-
-```bash
-./get-foundry-resources.sh --template .env.luna.example --output .env.luna
-./get-foundry-resources.sh --template .env.terra.example --output .env.terra
-```
-
-The discovery helper requires Bash and an interactive terminal. On Windows,
-run it from Git Bash or WSL, or fill the profile values manually in PowerShell.
 
 Authenticate before a live run:
 
@@ -211,6 +188,21 @@ Authenticate before a live run:
 az login
 az account show
 ```
+
+> OPTIONAL SCRIPT FOR RESOURCE DISCOVERY - WORK IN PROGRESS
+> To discover existing resources and generate each profile interactively, use
+> the matching tracked template. Run the command twice and select the appropriate
+> model pair each time:
+>
+> ```bash
+> ./get-foundry-resources.sh --template .env.luna.example --output .env.luna
+> ./get-foundry-resources.sh --template .env.terra.example --output .env.terra
+> ```
+>
+> The discovery helper requires Bash and an interactive terminal. On Windows,
+> run it from Git Bash or WSL, or fill the profile values manually in PowerShell.
+
+
 
 ## Run
 
@@ -245,15 +237,16 @@ python app.py --env-file .env.luna
 python app.py --env-file .env.terra
 ```
 
-Each full comparison contains 144 measured scenario executions. The Luna
-profile has a nominal duration of 127.2 minutes and a 145-minute hard limit.
-The Terra profile uses 180-second trials so its target-rate open-loop scenarios
-schedule about 107 requests per trial; it has a nominal duration of 439.2
-minutes and a 460-minute hard limit. Below-target Terra scenarios schedule
-about 54 requests per trial, so their p95 and p99 values remain directional.
-Both estimates exclude warm-up and request drain. Running both profiles takes
-about 566.4 nominal minutes in total. Review each current estimate with
-`--dry-run` before starting.
+Each full comparison contains 96 measured scenario executions. The Luna
+profile uses 50-second trials, has a nominal duration of 84.8 minutes, and
+retains a 145-minute hard limit. Its open-loop scenarios schedule about 150,
+298, and 442 requests per trial at the below-target, target, and above-target
+rates. The Terra profile uses 100-second trials, has a nominal duration of
+164.8 minutes, and has a 180-minute hard limit. Its open-loop scenarios
+schedule about 30, 60, and 88 requests per trial, so per-trial p95 and p99
+values remain directional. Both estimates exclude warm-up and request drain.
+Running both profiles takes about 249.6 nominal minutes in total. Review each
+current estimate with `--dry-run` before starting.
 
 The runner warms both deployments before measurement, alternates deployment
 order between trials, checkpoints aggregates after every measured scenario,

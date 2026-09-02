@@ -1816,8 +1816,8 @@ def readiness_errors(
 
     if cfg.warmup_requests < 1:
         errors.append("warmup_requests must be at least 1")
-    if cfg.trials < 3:
-        errors.append("trials must be at least 3")
+    if cfg.trials < 2:
+        errors.append("trials must be at least 2")
     if cfg.max_in_flight < 1:
         errors.append("max_in_flight must be at least 1")
     if not math.isfinite(cfg.trial_duration_s) or cfg.trial_duration_s <= 0:
